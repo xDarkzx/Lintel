@@ -65,7 +65,7 @@ def test_remote_unlock_needs_a_reason_and_is_journalled(env):
     assert client.post("/api/doors/1/command", json={"command": "unlock", "reason": "courier at loading bay"}).status_code == 200
     ev = client.get("/api/events?kind=door.remote_unlock").json()[0]
     assert "courier" in ev["detail"] and ev["operator"] == "admin"
-    assert ctl.commands[1][0] == 5
+    assert ctl.commands[1][-1][0] == 5
 
 
 def test_image_bomb_rejected_before_decoding(env):

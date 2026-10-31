@@ -39,3 +39,12 @@ def test_diag_is_decoded_and_shown(env):
     d = client.get("/api/doors/1").json()["diag"]
     assert d["firmware"] == "0.4.0" and d["reset_reason"] == "crash (panic)" and d["temp_c"] == 47
     assert d["camera"] is True and d["reader"] is False and d["last_decision_ms"] == 38
+
+
+def test_commands_queue_in_order_without_overwriting(env):
+    store, ctl, client, panel, gid = env
+    client.post("/api/doors/1/command", json={"command": "unlock", "reason": "delivery"})
+    client.post("/api/doors/1/command", json={"command": "screenshot"})
+    assert heartbeat(ctl, panel)[0] == 5
+    assert heartbeat(ctl, panel)[0] == 3
+    assert heartbeat(ctl, panel) == (0, 0)
