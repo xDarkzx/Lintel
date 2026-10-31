@@ -33,6 +33,7 @@ MAGIC = b"\xA5\x5A"
 # controller -> panel
 FRAME_DOWN = 0x01
 PROVISION = 0x02
+SERVER_STATE = 0x03
 PING = 0x05
 # panel -> controller
 FRAME_UP = 0x81
@@ -173,11 +174,14 @@ class DoorController:
         except OSError as e:
             log.warning("announce failed: %s", e)
             return
+        state = reply.get("state")
         if reply.get("provision"):
             log.info("delivering sealed door assignment to %s", body["serial"])
             self.send_panel(PROVISION, bytes.fromhex(reply["provision"]))
-        elif reply.get("state") == "unassigned" and body["door"] == 0:
+        elif state == "unassigned":
             log.info("%s is waiting for adoption in the dashboard", body["serial"])
+        if state in ("assigned", "unassigned"):
+            self.send_panel(SERVER_STATE, bytes([1 if state == "assigned" else 0]))
 
     def upload_photo(self, ph: dict) -> None:
         if self.door_id is None:

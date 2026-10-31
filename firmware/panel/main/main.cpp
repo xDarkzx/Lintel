@@ -55,6 +55,7 @@ Config s_cfg = {};
 Identity s_id = {};
 bool s_provisioned = false;
 uint32_t s_adopt_seq = 0;
+volatile bool s_server_unassigned = false;  // the server's view wins over what NVS holds
 QueueHandle_t s_pin_q = nullptr;
 QueueHandle_t s_down_q = nullptr;  // sealed frames arriving from the controller
 
@@ -140,8 +141,25 @@ void announce_task(void*) {
                                   s_provisioned ? s_cfg.door_id : 0, static_cast<unsigned long>(s_adopt_seq));
             usb_link_send(kLinkAnnounce, buf, static_cast<uint16_t>(lintel::kX25519Len + n));
         }
-        if (!s_provisioned) ui_show_adoption(s_id.serial, s_id.pairing_code, usb_link_host_connected());
-        vTaskDelay(pdMS_TO_TICKS(s_provisioned ? 15000 : 3000));
+        bool show = !s_provisioned || s_server_unassigned;
+        if (show) ui_show_adoption(s_id.serial, s_id.pairing_code, usb_link_host_connected());
+        vTaskDelay(pdMS_TO_TICKS(show ? 3000 : 15000));
+    }
+}
+
+// The server says whether it has us on a door. A panel set up by hand (or
+// one whose door was deleted) shows the pairing screen until it is adopted.
+void on_server_state(const uint8_t* p, size_t len, void*) {
+    if (len < 1) return;
+    bool unassigned = p[0] == 0;
+    if (unassigned == s_server_unassigned) return;
+    s_server_unassigned = unassigned;
+    if (unassigned) {
+        ESP_LOGW(TAG, "server lists this panel as unassigned; showing pairing code %06lu",
+                 static_cast<unsigned long>(s_id.pairing_code));
+        ui_show_adoption(s_id.serial, s_id.pairing_code, true);
+    } else if (s_provisioned) {
+        ui_hide_adoption();
     }
 }
 
@@ -264,7 +282,7 @@ void handle_pin(const PinMsg& m) {
     }
 }
 
-bool heartbeat(bool& lockdown) {
+bool heartbeat(bool& lockdown, char* door_name, size_t name_cap) {
     Heartbeat hb{0, 0, 0, 0, now_ms() / 1000, 0};
     uint8_t pt[Heartbeat::kLen];
     encode(hb, pt);
@@ -277,7 +295,8 @@ bool heartbeat(bool& lockdown) {
         return false;
     }
     lockdown = ack.mode == SiteMode::Lockdown;
-    if (ack.time > 1700000000u) set_clock(ack.time);
+    if (ack.time > 1700000000u) set_clock(ack.time);  // the server is the clock
+    std::snprintf(door_name, name_cap, "%s", ack.door_name);
     return true;
 }
 
@@ -297,7 +316,9 @@ void net_task(void*) {
 
         bool wired = usb_link_host_connected();
         bool ld = lockdown;
-        bool alive = wired && heartbeat(ld);
+        char name[24] = {};
+        bool alive = wired && heartbeat(ld, name, sizeof(name));
+        if (alive && name[0]) ui_set_door_name(name);
         missed = alive ? 0 : missed + 1;
         if (alive && ld != lockdown) {
             lockdown = ld;
@@ -391,7 +412,7 @@ extern "C" void app_main(void) {
     char hello[96];
     std::snprintf(hello, sizeof(hello), "lintel-panel/1 serial=%s door=%u fw=%s", s_id.serial,
                   s_provisioned ? s_cfg.door_id : 0, kFirmware);
-    usb_link_start(hello, on_down_frame, on_provision, nullptr);
+    usb_link_start(hello, on_down_frame, on_provision, on_server_state, nullptr);
     xTaskCreate(announce_task, "announce", 4096, nullptr, 4, nullptr);
     ESP_LOGI(TAG, "%s pairing code %06lu", s_id.serial, static_cast<unsigned long>(s_id.pairing_code));
 

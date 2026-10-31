@@ -206,7 +206,7 @@ void Controller::handle_event(DoorSlot& d, const Header& h, const uint8_t* pt, s
 }
 
 void Controller::ack(DoorSlot& d, uint32_t counter) {
-    HeartbeatAck a{mode_, cards_.cache_version(), io_.wall_time(), counter};
+    HeartbeatAck a{mode_, cards_.cache_version(), io_.wall_time(), counter, CredMode::Card, {}};
     uint8_t out[HeartbeatAck::kLen];
     encode(a, out);
     send_to(d, MsgType::HeartbeatAck, out, sizeof(out));

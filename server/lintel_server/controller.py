@@ -15,8 +15,8 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from .access import AccessEngine
-from .protocol import (Decision, FrameError, Header, Heartbeat, HeartbeatAck, MsgType, PinReq, PinResp, Reason,
-                       ReplayWindow, SiteMode, dir_for, Dir, open_frame, peek_header, seal)
+from .protocol import (CredReq, Decision, FrameError, Header, Heartbeat, HeartbeatAck, MsgType, PinReq, PinResp,
+                       Reason, ReplayWindow, SiteMode, dir_for, Dir, open_frame, peek_header, seal)
 from .store import Store
 
 log = logging.getLogger("lintel.controller")
@@ -29,7 +29,11 @@ REASON_TEXT = {
     Reason.OK: "granted", Reason.BAD_PIN: "PIN not recognised", Reason.REVOKED: "cardholder inactive or expired",
     Reason.DOOR_NOT_ALLOWED: "no access to this door", Reason.OUTSIDE_SCHEDULE: "outside schedule",
     Reason.LOCKDOWN: "site lockdown", Reason.LOCKED_OUT: "keypad locked out",
+    Reason.UNKNOWN_CARD: "card not recognised", Reason.NO_MATCH: "face not recognised",
+    Reason.MISMATCH: "credentials belong to different people", Reason.WRONG_MODE: "credential not accepted here",
+    Reason.ENROLLED: "card enrolled",
 }
+FACE_RESULT_TTL_S = 30
 
 
 def photo_key(door_key: bytes) -> bytes:
@@ -59,6 +63,8 @@ class Controller:
     publish: Callable[[dict[str, Any]], None]
     doors: dict[int, DoorLink] = field(default_factory=dict)
     transport: asyncio.DatagramTransport | None = None
+    # (door, ref) -> (cardholder or None, score, time, jpeg, error) from /api/door/{id}/face
+    face_results: dict[tuple[int, int], tuple] = field(default_factory=dict)
 
     # ---- door table -----------------------------------------------------------
 
@@ -123,13 +129,18 @@ class Controller:
         try:
             if h.type == MsgType.PIN_REQ:
                 self._on_pin(d, h, PinReq.decode(pt), addr, now)
+            elif h.type == MsgType.CRED_REQ:
+                self._on_cred(d, h, CredReq.decode(pt), addr, now)
             elif h.type == MsgType.HEARTBEAT:
                 hb = Heartbeat.decode(pt)
                 self.store.x("UPDATE doors SET rssi=? WHERE id=?", (hb.last_rssi, d.id))
-                ack = HeartbeatAck(self.engine.site_mode(), 0, int(now), h.counter)
+                ack = HeartbeatAck(self.engine.site_mode(), 0, int(now), h.counter, self.engine.door_mode(d.id),
+                                   d.name)
                 self._send(d, MsgType.HEARTBEAT_ACK, ack.encode(), addr)
         except FrameError as e:
             self._reject(d, now, f"malformed payload: {e}")
+
+    on_face_evidence: Callable[[dict, bytes, str, str], None] | None = None
 
     def _reject(self, d: DoorLink, now: float, why: str) -> None:
         d.rejects += 1
@@ -143,8 +154,26 @@ class Controller:
             self.publish({"type": "event", "event": ev})
             self.publish({"type": "alarm", "alarm": al})
 
+    def _on_cred(self, d: DoorLink, h: Header, req: CredReq, addr: tuple[str, int], now: float) -> None:
+        face = None
+        face_jpeg = None
+        if req.face_ref:
+            got = self.face_results.pop((d.id, req.face_ref), None)
+            if got is None or now - got[2] > FACE_RESULT_TTL_S:
+                face = (None, 0.0)  # no fresh, signed face image behind this reference
+            else:
+                face = (got[0], got[1])
+                face_jpeg = got[3]
+        v = self.engine.decide(d.id, pin=req.pin or None, card=req.uid or None, face=face, now=now,
+                               enforce_mode=True)
+        if face is not None:
+            v.method = f"face {face[1]:.2f}" + (" + PIN" if req.pin else "")
+        self._decided(d, h, v, addr, now, face_jpeg)
+
     def _on_pin(self, d: DoorLink, h: Header, req: PinReq, addr: tuple[str, int], now: float) -> None:
-        v = self.engine.decide_pin(d.id, req.pin, now)
+        self._decided(d, h, self.engine.decide_pin(d.id, req.pin, now), addr, now, None)
+
+    def _decided(self, d: DoorLink, h: Header, v, addr: tuple[str, int], now: float, face_jpeg: bytes | None) -> None:
         ch = v.cardholder
         who = f"{ch['first_name']} {ch['last_name']}" if ch else None
         granted = v.decision == Decision.GRANT
@@ -155,11 +184,17 @@ class Controller:
 
         # A duress grant is journalled as a normal grant; only the alarm says otherwise,
         # so nothing visible at the door gives the user away.
-        ev = self.store.journal("access.granted" if granted else "access.denied", door_id=d.id,
+        kind = "credential.enrolled" if v.reason == Reason.ENROLLED else (
+            "access.granted" if granted else "access.denied")
+        via = f" ({v.method})" if v.method else ""
+        ev = self.store.journal(kind, door_id=d.id,
                                 cardholder_id=ch["id"] if ch else None, decision=v.decision.name.lower(),
                                 reason=v.reason.name.lower(),
-                                detail=f"{who or 'Unknown PIN'} at {d.name}: {REASON_TEXT.get(v.reason, v.reason.name)}",
+                                detail=f"{who or 'Unknown'} at {d.name}: {REASON_TEXT.get(v.reason, v.reason.name)}{via}",
                                 req_ctr=h.counter)
+        if face_jpeg is not None and self.on_face_evidence is not None:
+            # The face image the decision was based on becomes the event photo.
+            self.on_face_evidence(ev, face_jpeg, d.name, who or "unrecognised")
         self.publish({"type": "event", "event": ev})
         log.info("door %d pin -> %s (%s) %s", d.id, v.decision.name, v.reason.name, who or "")
 

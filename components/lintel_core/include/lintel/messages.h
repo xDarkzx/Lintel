@@ -31,6 +31,20 @@ enum class Reason : uint8_t {
     Offline = 9,       // decided by the door without the controller
     BadPin = 10,       // no user has this PIN
     LockedOut = 11,    // too many wrong PINs at this keypad
+    Enrolled = 12,     // credential captured for a cardholder (enrolment mode), door stays shut
+    NoMatch = 13,      // face not recognised
+    WrongMode = 14,    // credential not accepted at this door
+    Mismatch = 15,     // card and PIN (or face and PIN) belong to different people
+};
+
+// What a door accepts; the panel's screen follows it.
+enum class CredMode : uint8_t {
+    Pin = 0,
+    Card = 1,
+    CardOrPin = 2,
+    CardAndPin = 3,
+    Face = 4,
+    FaceAndPin = 5,
 };
 
 const char* reason_name(Reason r);
@@ -74,11 +88,13 @@ struct Heartbeat {
 };
 
 struct HeartbeatAck {
-    static constexpr size_t kLen = 1 + 2 + 4 + 4;
+    static constexpr size_t kLen = 1 + 2 + 4 + 4 + 1 + 24;
     SiteMode mode;
     uint16_t cache_version;  // latest offline cache the controller holds
     uint32_t time;           // controller wall clock, seconds
     uint32_t hb_counter;     // the Heartbeat frame counter this answers
+    CredMode cred_mode;      // what this door accepts
+    char door_name[24];      // as named on the server, zero padded
 };
 
 enum class EventKind : uint8_t {
@@ -138,6 +154,24 @@ struct PinResp {
     char name[kNameMaxLen];  // greeting on grant, zero padded
 };
 
+constexpr size_t kCardUidMax = 10;
+
+// Any credential, or a pair of them, in one request so that "card + PIN" and
+// "face + PIN" are a single, atomic decision.
+constexpr uint8_t kCredCard = 1 << 0;
+constexpr uint8_t kCredPin = 1 << 1;
+constexpr uint8_t kCredFace = 1 << 2;
+
+struct CredReq {
+    static constexpr size_t kLen = 1 + 1 + kCardUidMax + 1 + kPinMaxLen + 4;
+    uint8_t present;  // kCred* bits
+    uint8_t uid_len;  // 4, 7 or 10 when kCredCard
+    uint8_t uid[kCardUidMax];
+    uint8_t pin_len;
+    char pin[kPinMaxLen];
+    uint32_t face_ref;  // reference of the face image the controller uploaded
+};
+
 // Offline cache entry: first 8 bytes of SHA-256(UID).
 bool uid_cache_tag(const uint8_t uid[kUidLen], uint8_t out[kCacheEntryLen]);
 
@@ -150,6 +184,7 @@ size_t encode(const ModeMsg& m, uint8_t* out);
 size_t encode(const CacheChunk& m, uint8_t* out);
 size_t encode(const PinReq& m, uint8_t* out);
 size_t encode(const PinResp& m, uint8_t* out);
+size_t encode(const CredReq& m, uint8_t* out);
 
 bool decode(const uint8_t* p, size_t len, AccessReq& m);
 bool decode(const uint8_t* p, size_t len, AccessResp& m);
@@ -160,5 +195,6 @@ bool decode(const uint8_t* p, size_t len, ModeMsg& m);
 bool decode(const uint8_t* p, size_t len, CacheChunk& m);
 bool decode(const uint8_t* p, size_t len, PinReq& m);
 bool decode(const uint8_t* p, size_t len, PinResp& m);
+bool decode(const uint8_t* p, size_t len, CredReq& m);
 
 }  // namespace lintel

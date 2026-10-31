@@ -19,6 +19,7 @@ namespace panel {
 // controller -> panel
 constexpr uint8_t kLinkFrameDown = 0x01;  // sealed frame from the server
 constexpr uint8_t kLinkProvision = 0x02;  // adoption blob sealed to this panel's key
+constexpr uint8_t kLinkServerState = 0x03; // u8: 0 = server lists us as unassigned, 1 = assigned
 constexpr uint8_t kLinkPing = 0x05;
 
 // panel -> controller
@@ -32,7 +33,8 @@ constexpr uint8_t kLinkAnnounce = 0x89;    // pubkey[32] then "serial=.. mac=.. 
 
 using LinkFrameFn = void (*)(const uint8_t* frame, size_t len, void* ctx);
 
-void usb_link_start(const char* hello, LinkFrameFn on_frame, LinkFrameFn on_provision, void* ctx);
+void usb_link_start(const char* hello, LinkFrameFn on_frame, LinkFrameFn on_provision, LinkFrameFn on_state,
+                    void* ctx);
 void usb_link_send(uint8_t type, const uint8_t* payload, uint16_t len);
 bool usb_link_host_connected();
 

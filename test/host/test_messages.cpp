@@ -53,12 +53,14 @@ TEST(Messages, HeartbeatAndAckRoundTrip) {
     EXPECT_EQ(g.uptime_s, 123456u);
     EXPECT_EQ(g.pending_events, 3);
 
-    HeartbeatAck a{SiteMode::Lockdown, 9, 1700000000u, 55};
+    HeartbeatAck a{SiteMode::Lockdown, 9, 1700000000u, 55, CredMode::CardAndPin, "Back Door"};
     encode(a, buf);
     HeartbeatAck ga{};
     ASSERT_TRUE(decode(buf, HeartbeatAck::kLen, ga));
     EXPECT_EQ(ga.mode, SiteMode::Lockdown);
     EXPECT_EQ(ga.hb_counter, 55u);
+    EXPECT_EQ(ga.cred_mode, CredMode::CardAndPin);
+    EXPECT_STREQ(ga.door_name, "Back Door");
     buf[0] = 7;
     EXPECT_FALSE(decode(buf, HeartbeatAck::kLen, ga));
 }
@@ -142,4 +144,40 @@ TEST(Messages, PinRespRoundTrip) {
     encode(lock, buf);
     ASSERT_TRUE(decode(buf, PinResp::kLen, g));
     EXPECT_EQ(g.lockout_s, 30);
+}
+
+TEST(Messages, CredReqCardAndPin) {
+    CredReq r{};
+    r.present = kCredCard | kCredPin;
+    r.uid_len = 7;
+    const uint8_t uid[7] = {0x04, 0xA1, 0xB2, 0xC3, 0xD4, 0xE5, 0xF6};
+    std::memcpy(r.uid, uid, 7);
+    r.pin_len = 4;
+    std::memcpy(r.pin, "2580", 4);
+    uint8_t buf[64];
+    ASSERT_EQ(encode(r, buf), CredReq::kLen);
+    CredReq g{};
+    ASSERT_TRUE(decode(buf, CredReq::kLen, g));
+    EXPECT_EQ(g.uid_len, 7);
+    EXPECT_EQ(std::string(g.pin, 4), "2580");
+
+    buf[1] = 5;  // UID lengths are 4, 7 or 10
+    EXPECT_FALSE(decode(buf, CredReq::kLen, g));
+    buf[1] = 7;
+    buf[2 + 9] = 0xFF;  // bytes past the UID must be zero
+    EXPECT_FALSE(decode(buf, CredReq::kLen, g));
+}
+
+TEST(Messages, CredReqFaceNeedsReference) {
+    CredReq r{};
+    r.present = kCredFace;
+    uint8_t buf[64];
+    encode(r, buf);
+    CredReq g{};
+    EXPECT_FALSE(decode(buf, CredReq::kLen, g));
+    r.face_ref = 77;
+    encode(r, buf);
+    EXPECT_TRUE(decode(buf, CredReq::kLen, g));
+    buf[0] = 0;  // nothing presented
+    EXPECT_FALSE(decode(buf, CredReq::kLen, g));
 }

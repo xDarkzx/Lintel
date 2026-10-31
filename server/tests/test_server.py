@@ -147,6 +147,8 @@ def test_heartbeat_ack_carries_mode_and_binds_counter(env):
     h, pt = open_frame(panel.key, panel.net, ctl.transport.sent[-1])
     assert h.type == MsgType.HEARTBEAT_ACK and pt[0] == 1
     assert int.from_bytes(pt[7:11], "little") == panel.ctr
+    # Must equal HeartbeatAck::kLen in the C++ core or the panel drops every ack.
+    assert len(pt) == 36 and pt[12:].rstrip(b"\x00") == b"Main Entrance"
 
 
 def test_controller_counters_survive_restart(env):

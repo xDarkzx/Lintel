@@ -31,6 +31,7 @@ QueueHandle_t s_rxq = nullptr;
 SemaphoreHandle_t s_tx_mutex = nullptr;
 LinkFrameFn s_on_frame = nullptr;
 LinkFrameFn s_on_provision = nullptr;
+LinkFrameFn s_on_state = nullptr;
 void* s_ctx = nullptr;
 volatile bool s_dtr = false;
 char s_hello[96] = {};
@@ -64,6 +65,8 @@ void dispatch(uint8_t type, const uint8_t* p, uint16_t len) {
         s_on_frame(p, len, s_ctx);
     } else if (type == kLinkProvision && s_on_provision != nullptr) {
         s_on_provision(p, len, s_ctx);
+    } else if (type == kLinkServerState && s_on_state != nullptr) {
+        s_on_state(p, len, s_ctx);
     } else if (type == kLinkPing) {
         usb_link_send(kLinkPong, nullptr, 0);
         send_hello();
@@ -128,9 +131,11 @@ void rx_task(void*) {
 
 }  // namespace
 
-void usb_link_start(const char* hello, LinkFrameFn on_frame, LinkFrameFn on_provision, void* ctx) {
+void usb_link_start(const char* hello, LinkFrameFn on_frame, LinkFrameFn on_provision, LinkFrameFn on_state,
+                    void* ctx) {
     s_on_frame = on_frame;
     s_on_provision = on_provision;
+    s_on_state = on_state;
     s_ctx = ctx;
     std::snprintf(s_hello, sizeof(s_hello), "%s", hello);
     s_rxq = xQueueCreate(8, sizeof(RxMsg));

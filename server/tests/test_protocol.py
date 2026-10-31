@@ -1,7 +1,7 @@
 import pytest
 
-from lintel_server.protocol import (Decision, FrameError, Header, MsgType, PinReq, PinResp, Reason, ReplayWindow,
-                                    open_frame, seal)
+from lintel_server.protocol import (CredReq, Decision, FrameError, Header, MsgType, PinReq, PinResp, Reason,
+                                    ReplayWindow, open_frame, seal)
 
 KEY = bytes([0x11] * 16)
 NET = 0x4C4E5401
@@ -44,3 +44,19 @@ def test_replay_window():
     assert not w.accepts(36)
     w2 = ReplayWindow(500)
     assert not w2.accepts(500) and not w2.accepts(470) and w2.accepts(501)
+
+
+def test_golden_cred_req_matches_cpp_core():
+    p = bytes([3, 7, 4, 0xA1, 0xB2, 0xC3, 0xD4, 0xE5, 0xF6]) + bytes(3) + bytes([4]) + b"2580" + bytes(4) + bytes(4)
+    assert seal(KEY, NET, Header(MsgType.CRED_REQ, 0, 3, 43), p).hex() == "1a0003002b00000048d7958be7f4d9ea1d489bdd76a7e6ad7cb31f739ba76e9e1d88d4f19741299c33"
+    r = CredReq.decode(p)
+    assert r.uid.hex() == "04a1b2c3d4e5f6" and r.pin == "2580" and r.face_ref == 0
+
+
+def test_cred_req_rejects_inconsistent_fields():
+    face_without_ref = bytes([4, 0]) + bytes(10) + bytes([0]) + bytes(8) + bytes(4)
+    with pytest.raises(FrameError):
+        CredReq.decode(face_without_ref)
+    bad_uid_len = bytes([1, 5]) + bytes(10) + bytes([0]) + bytes(8) + bytes(4)
+    with pytest.raises(FrameError):
+        CredReq.decode(bad_uid_len)

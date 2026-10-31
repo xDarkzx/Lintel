@@ -134,6 +134,14 @@ CREATE TABLE IF NOT EXISTS devices (
     pending_door INTEGER
 );
 
+CREATE TABLE IF NOT EXISTS face_templates (
+    id INTEGER PRIMARY KEY,
+    cardholder_id INTEGER NOT NULL REFERENCES cardholders(id) ON DELETE CASCADE,
+    embedding BLOB NOT NULL,
+    source TEXT NOT NULL,
+    created REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS alarms (
     id INTEGER PRIMARY KEY,
     ts REAL NOT NULL,
@@ -259,6 +267,10 @@ class Store:
         """Keyed hash of a PIN. The key (pepper) lives in secrets.json, not
         the database, so a stolen database cannot be brute-forced offline."""
         return hmac.new(self.secrets.pepper, b"lintel-pin:" + pin.encode(), hashlib.sha256).digest()
+
+    def card_tag(self, uid: bytes) -> bytes:
+        """Keyed hash of a card UID, so the database never holds raw card numbers."""
+        return hmac.new(self.secrets.pepper, b"lintel-card:" + uid, hashlib.sha256).digest()
 
     # ---- the journal ----------------------------------------------------------
 

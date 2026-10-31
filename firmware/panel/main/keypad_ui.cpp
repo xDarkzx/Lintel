@@ -44,6 +44,7 @@ constexpr uint32_t kAmber = 0xF59E0B;
 SubmitFn s_submit = nullptr;
 void* s_ctx = nullptr;
 
+lv_obj_t* s_door_label = nullptr;
 lv_obj_t* s_status_dot = nullptr;
 lv_obj_t* s_status_text = nullptr;
 lv_obj_t* s_banner = nullptr;
@@ -246,6 +247,7 @@ void build_header(lv_obj_t* scr, const char* door_name) {
     lv_obj_t* door = label(scr, &lv_font_montserrat_16, kMuted, door_name);
     lv_obj_set_style_text_letter_space(door, 3, 0);
     lv_obj_align(door, LV_ALIGN_TOP_MID, 0, 28);
+    s_door_label = door;
 
     lv_obj_t* chip = lv_obj_create(scr);
     lv_obj_remove_style_all(chip);
@@ -532,6 +534,12 @@ void ui_set_link(bool wired, bool server, int rssi) {
     bsp_display_unlock();
 }
 
+void ui_set_door_name(const char* name) {
+    bsp_display_lock(0);
+    if (std::strcmp(lv_label_get_text(s_door_label), name) != 0) lv_label_set_text(s_door_label, name);
+    bsp_display_unlock();
+}
+
 void ui_set_lockdown(bool on) {
     bsp_display_lock(0);
     s_lockdown = on;
@@ -569,6 +577,12 @@ void ui_show_adoption(const char* serial, uint32_t pairing_code, bool controller
     lv_obj_set_style_text_color(s_adopt_link, lv_color_hex(controller ? kGreen : kAmber), 0);
     lv_obj_clear_flag(s_adopt, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(s_adopt);
+    bsp_display_unlock();
+}
+
+void ui_hide_adoption() {
+    bsp_display_lock(0);
+    lv_obj_add_flag(s_adopt, LV_OBJ_FLAG_HIDDEN);
     bsp_display_unlock();
 }
 

@@ -28,7 +28,7 @@ void write_header(const Header& h, uint8_t* p) {
 
 bool msg_type_valid(uint8_t raw) {
     return raw >= static_cast<uint8_t>(MsgType::AccessReq) &&
-           raw <= static_cast<uint8_t>(MsgType::PinResp);
+           raw <= static_cast<uint8_t>(MsgType::CredReq);
 }
 
 Dir dir_for(MsgType t) {
@@ -37,6 +37,7 @@ Dir dir_for(MsgType t) {
         case MsgType::Heartbeat:
         case MsgType::Event:
         case MsgType::PinReq:
+        case MsgType::CredReq:
             return Dir::DoorToCtrl;
         case MsgType::Mode:
             return Dir::Broadcast;

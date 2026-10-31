@@ -125,3 +125,18 @@ TEST(Frame, GoldenVectorsMatchServer) {
     EXPECT_EQ(testutil::bytes(f, n),
               testutil::hex("19000300070000009bac2719cda2831474e2e0785f908a958ed37e4e68e52d3dc31beb0cd821468be039"));
 }
+
+TEST(Frame, GoldenCredReqMatchesServer) {
+    CredReq r{};
+    r.present = kCredCard | kCredPin;
+    r.uid_len = 7;
+    const uint8_t uid[7] = {0x04, 0xA1, 0xB2, 0xC3, 0xD4, 0xE5, 0xF6};
+    std::memcpy(r.uid, uid, 7);
+    r.pin_len = 4;
+    std::memcpy(r.pin, "2580", 4);
+    uint8_t pt[CredReq::kLen];
+    encode(r, pt);
+    uint8_t f[kMaxFrame];
+    size_t n = seal_frame(testutil::key_fill(0x11), kNet, Header{MsgType::CredReq, 0, 3, 43}, pt, sizeof(pt), f, sizeof(f));
+    EXPECT_EQ(testutil::bytes(f, n), testutil::hex("1a0003002b00000048d7958be7f4d9ea1d489bdd76a7e6ad7cb31f739ba76e9e1d88d4f19741299c33"));
+}

@@ -20,6 +20,10 @@ const char* reason_name(Reason r) {
         case Reason::Offline: return "offline";
         case Reason::BadPin: return "bad-pin";
         case Reason::LockedOut: return "locked-out";
+        case Reason::Enrolled: return "enrolled";
+        case Reason::NoMatch: return "no-match";
+        case Reason::WrongMode: return "wrong-mode";
+        case Reason::Mismatch: return "mismatch";
     }
     return "?";
 }
@@ -60,7 +64,7 @@ size_t encode(const AccessResp& m, uint8_t* out) {
 bool decode(const uint8_t* p, size_t len, AccessResp& m) {
     if (len != AccessResp::kLen) return false;
     if (p[4] > static_cast<uint8_t>(Decision::Grant)) return false;
-    if (p[5] > static_cast<uint8_t>(Reason::LockedOut)) return false;
+    if (p[5] > static_cast<uint8_t>(Reason::Mismatch)) return false;
     m.req_counter = get_u32(p);
     m.decision = static_cast<Decision>(p[4]);
     m.reason = static_cast<Reason>(p[5]);
@@ -95,6 +99,8 @@ size_t encode(const HeartbeatAck& m, uint8_t* out) {
     put_u16(out + 1, m.cache_version);
     put_u32(out + 3, m.time);
     put_u32(out + 7, m.hb_counter);
+    out[11] = static_cast<uint8_t>(m.cred_mode);
+    std::memcpy(out + 12, m.door_name, sizeof(m.door_name));
     return HeartbeatAck::kLen;
 }
 
@@ -105,6 +111,10 @@ bool decode(const uint8_t* p, size_t len, HeartbeatAck& m) {
     m.cache_version = get_u16(p + 1);
     m.time = get_u32(p + 3);
     m.hb_counter = get_u32(p + 7);
+    if (p[11] > static_cast<uint8_t>(CredMode::FaceAndPin)) return false;
+    m.cred_mode = static_cast<CredMode>(p[11]);
+    std::memcpy(m.door_name, p + 12, sizeof(m.door_name));
+    m.door_name[sizeof(m.door_name) - 1] = 0;
     return true;
 }
 
@@ -211,6 +221,39 @@ bool decode(const uint8_t* p, size_t len, PinResp& m) {
     std::memcpy(m.name, p + 10, kNameMaxLen);
     m.name[kNameMaxLen - 1] = 0;
     return (m.decision == Decision::Grant) == (m.reason == Reason::Ok);
+}
+
+size_t encode(const CredReq& m, uint8_t* out) {
+    out[0] = m.present;
+    out[1] = m.uid_len;
+    std::memcpy(out + 2, m.uid, kCardUidMax);
+    out[2 + kCardUidMax] = m.pin_len;
+    std::memcpy(out + 3 + kCardUidMax, m.pin, kPinMaxLen);
+    put_u32(out + 3 + kCardUidMax + kPinMaxLen, m.face_ref);
+    return CredReq::kLen;
+}
+
+bool decode(const uint8_t* p, size_t len, CredReq& m) {
+    if (len != CredReq::kLen) return false;
+    m.present = p[0];
+    if (m.present == 0 || (m.present & ~(kCredCard | kCredPin | kCredFace)) != 0) return false;
+    m.uid_len = p[1];
+    std::memcpy(m.uid, p + 2, kCardUidMax);
+    m.pin_len = p[2 + kCardUidMax];
+    std::memcpy(m.pin, p + 3 + kCardUidMax, kPinMaxLen);
+    m.face_ref = get_u32(p + 3 + kCardUidMax + kPinMaxLen);
+    bool card = (m.present & kCredCard) != 0;
+    if (card ? (m.uid_len != 4 && m.uid_len != 7 && m.uid_len != 10) : m.uid_len != 0) return false;
+    for (size_t i = m.uid_len; i < kCardUidMax; ++i) {
+        if (m.uid[i] != 0) return false;
+    }
+    bool pin = (m.present & kCredPin) != 0;
+    if (pin ? (m.pin_len < 4 || m.pin_len > kPinMaxLen) : m.pin_len != 0) return false;
+    for (size_t i = 0; i < kPinMaxLen; ++i) {
+        bool digit = m.pin[i] >= '0' && m.pin[i] <= '9';
+        if (i < m.pin_len ? !digit : m.pin[i] != 0) return false;
+    }
+    return ((m.present & kCredFace) != 0) == (m.face_ref != 0);
 }
 
 }  // namespace lintel

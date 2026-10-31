@@ -32,6 +32,7 @@ class MsgType(IntEnum):
     CACHE_CHUNK = 7
     PIN_REQ = 8
     PIN_RESP = 9
+    CRED_REQ = 10
 
 
 class Dir(IntEnum):
@@ -40,7 +41,7 @@ class Dir(IntEnum):
     BROADCAST = 2
 
 
-_UPLINK = {MsgType.ACCESS_REQ, MsgType.HEARTBEAT, MsgType.EVENT, MsgType.PIN_REQ}
+_UPLINK = {MsgType.ACCESS_REQ, MsgType.HEARTBEAT, MsgType.EVENT, MsgType.PIN_REQ, MsgType.CRED_REQ}
 
 
 def dir_for(t: MsgType) -> Dir:
@@ -69,6 +70,23 @@ class Reason(IntEnum):
     OFFLINE = 9
     BAD_PIN = 10
     LOCKED_OUT = 11
+    ENROLLED = 12
+    NO_MATCH = 13
+    WRONG_MODE = 14
+    MISMATCH = 15
+
+
+class CredMode(IntEnum):
+    PIN = 0
+    CARD = 1
+    CARD_OR_PIN = 2
+    CARD_AND_PIN = 3
+    FACE = 4
+    FACE_AND_PIN = 5
+
+    @staticmethod
+    def from_name(name: str) -> "CredMode":
+        return CredMode[name.upper()]
 
 
 class SiteMode(IntEnum):
@@ -187,9 +205,53 @@ class HeartbeatAck:
     cache_version: int
     time: int
     hb_counter: int
+    cred_mode: CredMode = CredMode.PIN
+    door_name: str = ""
 
     def encode(self) -> bytes:
-        return struct.pack("<BHII", self.mode, self.cache_version, self.time, self.hb_counter)
+        name = self.door_name.encode()[:23].ljust(24, b"\x00")
+        return struct.pack("<BHIIB", self.mode, self.cache_version, self.time, self.hb_counter, self.cred_mode) + name
+
+
+CRED_CARD, CRED_PIN, CRED_FACE = 1, 2, 4
+UID_MAX = 10
+
+
+@dataclass
+class CredReq:
+    present: int
+    uid: bytes
+    pin: str
+    face_ref: int
+
+    @staticmethod
+    def decode(p: bytes) -> "CredReq":
+        if len(p) != 1 + 1 + UID_MAX + 1 + PIN_MAX + 4:
+            raise FrameError("CredReq length")
+        present, uid_len = p[0], p[1]
+        if present == 0 or present & ~(CRED_CARD | CRED_PIN | CRED_FACE):
+            raise FrameError("CredReq flags")
+        uid = p[2:2 + UID_MAX]
+        if present & CRED_CARD:
+            if uid_len not in (4, 7, 10):
+                raise FrameError("CredReq uid length")
+        elif uid_len:
+            raise FrameError("CredReq stray uid")
+        if any(uid[uid_len:]):
+            raise FrameError("CredReq uid padding")
+        pin_len = p[2 + UID_MAX]
+        pin = p[3 + UID_MAX:3 + UID_MAX + PIN_MAX]
+        if present & CRED_PIN:
+            if not 4 <= pin_len <= PIN_MAX or not pin[:pin_len].isdigit():
+                raise FrameError("CredReq pin")
+        elif pin_len:
+            raise FrameError("CredReq stray pin")
+        if any(pin[pin_len:]):
+            raise FrameError("CredReq pin padding")
+        (face_ref,) = struct.unpack_from("<I", p, 3 + UID_MAX + PIN_MAX)
+        if bool(present & CRED_FACE) != bool(face_ref):
+            raise FrameError("CredReq face reference")
+        return CredReq(present, bytes(uid[:uid_len]), pin[:pin_len].decode(), face_ref)
 
 
 class ReplayWindow:
