@@ -14,6 +14,13 @@ security decisions written down and tested.
  └───────────────────────────────┘          └──────────────────────────────┘               └────────────────────────────┘
 ```
 
+<p align="center">
+  <img src="docs/media/panel-keypad.jpg" width="240" alt="Keypad screen, captured from the panel">
+  &nbsp;
+  <img src="docs/media/console-monitor.jpg" width="560" alt="Operations console monitor">
+</p>
+<p align="center"><sub>Left: the keypad's own screen, captured remotely from the console. Right: the operations console (entry photos blurred).</sub></p>
+
 The keypad has no network of its own and holds no PINs. Every message between
 keypad and server is sealed with that door's AES-128 key, so the controller in
 the middle, or anyone who takes it over, can relay traffic but cannot read it
@@ -47,6 +54,26 @@ or forge a grant.
   remote screenshot, test photo, identify, reboot
 - Face enrolment from entry photos; card enrolment by tapping at a door
 - Encrypted backup; alarm webhook to Teams, Slack or a pager
+
+## Screens
+
+![Console walkthrough: monitor, door diagnostics with a live screenshot requested from the keypad, cardholder credentials, schedules, audit chain verification](docs/media/console-walkthrough.gif)
+
+<sub>Recorded against the running system: the keypad screenshot in the door's diagnostics is requested from the real panel mid-recording (its clock moves from 20:11 to 20:15). Cardholder names are replaced and entry photos blurred.</sub>
+
+| | |
+|---|---|
+| ![Door diagnostics](docs/media/console-door-diagnostics.jpg) | ![Cardholder credentials](docs/media/console-cardholder-credentials.jpg) |
+| Door diagnostics: health, remote commands, live screen capture | Cardholder credentials: PIN, duress PIN, card and face enrolment |
+| ![Schedules](docs/media/console-schedules.jpg) | ![Audit trail](docs/media/console-audit.jpg) |
+| Schedules as week grids, with holidays | Audit trail verified end to end |
+
+## How it was built
+
+Almost all of the code was written by an AI coding agent under my direction,
+with every security claim backed by a test and checked on the hardware.
+[docs/BUILT-WITH-AI.md](docs/BUILT-WITH-AI.md) covers where the agent was
+wrong and what caught it.
 
 ## Security model
 
