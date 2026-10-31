@@ -45,7 +45,8 @@ TEST(Messages, AccessRespGrantMustCarryOk) {
 
 TEST(Messages, HeartbeatAndAckRoundTrip) {
     Heartbeat hb{kStatusTamper, 12, -97, 3700, 123456, 3};
-    uint8_t buf[32];
+    uint8_t buf[HeartbeatAck::kLen];  // the larger of the two messages
+    static_assert(HeartbeatAck::kLen >= Heartbeat::kLen, "buffer holds both messages");
     encode(hb, buf);
     Heartbeat g{};
     ASSERT_TRUE(decode(buf, Heartbeat::kLen, g));
