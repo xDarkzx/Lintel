@@ -596,14 +596,17 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int) -> FastAP
         if not hmac.compare_digest(mac, want):
             store.journal("photo.rejected", door_id=door_id, detail="bad signature")
             raise HTTPException(403, "bad signature")
-        ev = store.q1("SELECT * FROM events WHERE door_id=? AND req_ctr=? AND kind='access.granted' "
-                      "ORDER BY seq DESC LIMIT 1", (door_id, req))
+        # Every attempt at the keypad is photographed: grants, denials and lockouts.
+        ev = store.q1("SELECT * FROM events WHERE door_id=? AND req_ctr=? AND kind IN "
+                      "('access.granted', 'access.denied', 'credential.enrolled') ORDER BY seq DESC LIMIT 1",
+                      (door_id, req))
         if ev is None or ev["photo"] or time.time() - ev["ts"] > 120:
-            raise HTTPException(409, "no grant awaiting a photo")
+            raise HTTPException(409, "no attempt awaiting a photo")
         name = store.q1("SELECT first_name || ' ' || last_name n FROM cardholders WHERE id=?",
                         (ev["cardholder_id"],))
         rel = stamp_photo(store.data_dir / "photos", body, ev["seq"], ev["ts"], link.name,
-                          name["n"] if name else "unknown")
+                          name["n"] if name else ("LOCKOUT - unidentified" if ev["reason"] == "locked_out"
+                                                  else "unrecognised"))
         store.x("UPDATE events SET photo=? WHERE seq=?", (rel, ev["seq"]))
         # The photo's hash goes into the chain, so swapping the image later is detectable.
         pj = store.journal("photo.attached", door_id=door_id, cardholder_id=ev["cardholder_id"],

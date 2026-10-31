@@ -10,7 +10,7 @@ from datetime import datetime
 from .protocol import CredMode, Decision, Reason, SiteMode
 from .store import Store
 
-LOCKOUT_THRESHOLD = 5        # failed attempts in a row at one keypad
+LOCKOUT_THRESHOLD = 3        # failed attempts in a row at one keypad
 LOCKOUT_BASE_S = 30          # first lockout; doubles on each repeat
 LOCKOUT_MAX_S = 15 * 60
 ENROL_TTL_S = 60

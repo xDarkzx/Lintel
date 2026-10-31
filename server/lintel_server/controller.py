@@ -215,8 +215,10 @@ class Controller:
         if v.duress:
             alarm = self.store.raise_alarm(1, "duress", f"DURESS: {who} at {d.name}", door_id=d.id, event_seq=ev["seq"])
         elif v.lockout_started:
-            alarm = self.store.raise_alarm(2, "keypad.lockout", f"PIN guessing at {d.name}: keypad locked "
-                                           f"{v.lockout_s}s", door_id=d.id, event_seq=ev["seq"])
+            # Treated as an attempted break-in: critical, with the panel's photo
+            # of the person attached to this event when it arrives.
+            alarm = self.store.raise_alarm(1, "keypad.lockout", f"Possible PIN guessing at {d.name}: keypad locked "
+                                           f"for {v.lockout_s}s", door_id=d.id, event_seq=ev["seq"])
         if alarm:
             self.publish({"type": "alarm", "alarm": alarm})
 

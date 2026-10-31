@@ -208,14 +208,10 @@ void on_provision(const uint8_t* blob, size_t len, void*) {
 // ---- entry photo -----------------------------------------------------------------
 
 // Signed so the server can tell the photo came from this panel and belongs
-// to this grant: HMAC(photo_key, "door:req:" || sha256(jpeg)).
-void send_photo(uint32_t req_ctr) {
-    uint8_t* jpg = nullptr;
-    size_t n = 0;
-    if (!camera_snapshot(&jpg, &n, 1500)) {
-        ESP_LOGW(TAG, "no camera frame for grant %lu", static_cast<unsigned long>(req_ctr));
-        return;
-    }
+// to this attempt: HMAC(photo_key, "door:req:" || sha256(jpeg)). Takes
+// ownership of `jpg`.
+void send_photo(uint32_t req_ctr, uint8_t* jpg, size_t n) {
+    if (jpg == nullptr) return;
     static const char kLabel[] = "lintel-photo";
     uint8_t pkey[kSha256Len], digest[kSha256Len], mac[kSha256Len];
     char prefix[24];
@@ -350,6 +346,12 @@ void handle_pin(const PinMsg& m) {
     encode(req, pt);
     secure_zero(&req, sizeof(req));
 
+    // Photograph the person at the moment they press OK, before the decision,
+    // while they are still facing the panel. Every attempt is recorded.
+    uint8_t* jpg = nullptr;
+    size_t jpg_len = 0;
+    if (!camera_snapshot(&jpg, &jpg_len, 600)) jpg = nullptr;
+
     uint32_t ctr = 0;
     uint32_t t0 = now_ms();
     uint8_t reply[kMaxPayload];
@@ -360,6 +362,7 @@ void handle_pin(const PinMsg& m) {
     secure_zero(pt, sizeof(pt));
     if (!ok) {
         ESP_LOGW(TAG, "no valid reply from server");
+        free(jpg);  // no event on the server to attach it to
         ui_show_denied("No answer", "Controller or server unreachable.\nDoor stays locked.");
         return;
     }
@@ -370,7 +373,6 @@ void handle_pin(const PinMsg& m) {
         char title[40];
         std::snprintf(title, sizeof(title), "Welcome%s%s", resp.name[0] ? ", " : "", resp.name);
         ui_show_granted(title, "Door unlocked", resp.unlock_ms ? resp.unlock_ms : 5000);
-        send_photo(ctr);
     } else if (resp.reason == Reason::LockedOut) {
         ui_show_lockout(resp.lockout_s ? resp.lockout_s : 30);
     } else if (resp.reason == Reason::Lockdown) {
@@ -382,6 +384,7 @@ void handle_pin(const PinMsg& m) {
     } else {
         ui_show_denied("Access denied", "PIN not recognised");
     }
+    send_photo(ctr, jpg, jpg_len);
 }
 
 bool heartbeat(bool& lockdown, char* door_name, size_t name_cap, HeartbeatAck& out) {

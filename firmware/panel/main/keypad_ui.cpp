@@ -554,13 +554,16 @@ void apply_mode() {
 
 void lockout_tick(lv_timer_t* t) {
     if (s_lockout_left > 0) --s_lockout_left;
-    char buf[64];
-    std::snprintf(buf, sizeof(buf), "Keypad locked.\nTry again in %lu s", static_cast<unsigned long>(s_lockout_left));
+    char buf[96];
+    std::snprintf(buf, sizeof(buf), "Too many incorrect PINs.\nSecurity has been alerted.\n\nTry again in %lu s",
+                  static_cast<unsigned long>(s_lockout_left));
     lv_label_set_text(s_ov_detail, buf);
     if (s_lockout_left == 0) {
         lv_timer_del(t);
         s_lockout_timer = nullptr;
         lv_obj_add_flag(s_overlay, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(s_pad, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(s_dots_row, LV_OBJ_FLAG_HIDDEN);
         reset_entry();
     }
 }
@@ -705,7 +708,12 @@ void ui_show_message(const char* title, const char* detail) {
 void ui_show_lockout(uint32_t seconds) {
     bsp_display_lock(0);
     s_lockout_left = seconds + 1;  // the first tick below shows `seconds`
-    show_overlay(kAmber, ICON_ALERT, "Too many attempts", "", seconds * 1000 + 500, false);
+    // The keypad itself goes away for the whole lockout.
+    std::memset(s_pin, 0, sizeof(s_pin));
+    s_len = 0;
+    lv_obj_add_flag(s_pad, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_dots_row, LV_OBJ_FLAG_HIDDEN);
+    show_overlay(kRed, ICON_LOCK_WARN, "Keypad locked", "", seconds * 1000 + 500, false);
     if (s_overlay_timer != nullptr) {
         lv_timer_del(s_overlay_timer);
         s_overlay_timer = nullptr;

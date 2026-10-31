@@ -92,7 +92,18 @@ def test_bad_pin_then_lockout_and_alarm(env):
     r = resp(panel.pin("1111"))
     assert r[2] == Reason.LOCKED_OUT and r[4] >= 30
     assert resp(panel.pin("2468"))[2] == Reason.LOCKED_OUT  # even the right PIN, while locked
-    assert any(a["kind"] == "keypad.lockout" for a in client.get("/api/alarms").json())
+    lock = next(a for a in client.get("/api/alarms").json() if a["kind"] == "keypad.lockout")
+    assert lock["priority"] == 1
+
+    # The panel's photo of the person is accepted for the lockout attempt.
+    buf = io.BytesIO()
+    Image.new("RGB", (320, 240), (90, 20, 20)).save(buf, "JPEG")
+    jpeg = buf.getvalue()
+    req = panel.ctr - 1  # the attempt that started the lockout
+    mac = hmac.new(photo_key(panel.key), f"1:{req}:".encode() + hashlib.sha256(jpeg).digest(),
+                   hashlib.sha256).hexdigest()
+    r = client.post("/api/door/1/photo", content=jpeg, headers={"x-lintel-req": str(req), "x-lintel-mac": mac})
+    assert r.status_code == 200, r.text
 
 
 def test_duress_grants_silently_but_raises_critical_alarm(env):
@@ -185,6 +196,15 @@ def test_photo_upload_is_signed_stamped_and_chained(env):
     assert img.status_code == 200 and img.content[:2] == b"\xff\xd8"
     assert client.post("/api/door/1/photo", content=jpeg, headers={**hdr, "x-lintel-mac": mac}).status_code == 409
     assert any("sha256=" in e["detail"] for e in client.get("/api/events?kind=photo.*").json())
+
+    # A wrong PIN is photographed too.
+    assert resp(panel.pin("9999"))[2] == Reason.BAD_PIN
+    mac = hmac.new(photo_key(panel.key), f"1:{panel.ctr}:".encode() + hashlib.sha256(jpeg).digest(),
+                   hashlib.sha256).hexdigest()
+    r = client.post("/api/door/1/photo", content=jpeg, headers={"x-lintel-req": str(panel.ctr), "x-lintel-mac": mac})
+    assert r.status_code == 200, r.text
+    denied = client.get("/api/events?kind=access.denied").json()[0]
+    assert denied["photo"]
 
 
 def test_journal_detects_tampering(env):
