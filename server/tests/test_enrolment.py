@@ -287,3 +287,33 @@ def test_a_bare_pin_respects_the_doors_mode(en):
                        ("card_or_pin", Decision.GRANT), ("pin", Decision.GRANT)):
         assert client.patch("/api/doors/1", json={"credential_mode": mode}).status_code == 200
         assert resp(panel.pin("2468"))[1] == want, mode
+
+
+def test_face_refusals_say_exactly_why(en):
+    from lintel_server.protocol import Reason
+    store, client, panel, faces, live, ana = en
+    ctl = panel.ctl
+    client.patch("/api/doors/1", json={"credential_mode": "face_and_pin"})
+
+    # No face enrolled for the PIN's owner: said plainly, owner named, and not
+    # counted as guessing however often it happens.
+    for ref in (21, 22, 23, 24):
+        face_upload(client, panel, ref, faces.frame("front", ANA))
+        r = decide(ctl, panel, cred_frame(panel, "2468", ref))
+        assert (r[1], r[2]) == (Decision.DENY, Reason.FACE_NOT_ENROLLED)
+    ev = client.get("/api/events?kind=access.denied").json()[0]
+    assert ev["detail"] == "Ana Test at Main Entrance: no face enrolled for this person (face + PIN)"
+    assert "-1.00" not in ev["detail"]
+
+    # No face in the camera image.
+    enrol_template(store, ana, ANA)
+    face_upload(client, panel, 31, faces.frame(error="no face found"))
+    assert decide(ctl, panel, cred_frame(panel, "2468", 31))[2] == Reason.NO_FACE
+
+    # A face that matches nobody, and one that belongs to someone else.
+    face_upload(client, panel, 32, faces.frame("front", BEN))
+    assert decide(ctl, panel, cred_frame(panel, "2468", 32))[2] == Reason.NO_MATCH
+    zed = next(c["id"] for c in client.get("/api/cardholders").json() if c["first_name"] == "Zed")
+    enrol_template(store, zed, BEN)
+    face_upload(client, panel, 33, faces.frame("front", BEN))
+    assert decide(ctl, panel, cred_frame(panel, "2468", 33))[2] == Reason.MISMATCH

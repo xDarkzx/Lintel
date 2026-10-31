@@ -35,7 +35,12 @@ enum class Reason : uint8_t {
     NoMatch = 13,      // face not recognised
     WrongMode = 14,    // credential not accepted at this door
     Mismatch = 15,     // card and PIN (or face and PIN) belong to different people
+    NoFace = 16,       // the camera image had no usable face
+    FaceNotEnrolled = 17,  // the person has no enrolled face to compare with
 };
+// Decoders accept every reason up to this one; a panel must be able to read
+// every refusal the server can give, or it cannot say why the door stayed shut.
+constexpr Reason kLastReason = Reason::FaceNotEnrolled;
 
 // What a door accepts; the panel's screen follows it.
 enum class CredMode : uint8_t {

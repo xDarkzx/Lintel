@@ -48,7 +48,7 @@ constexpr uint32_t kAckTimeoutMs = 1500;
 constexpr uint32_t kHeartbeatMs = 5000;
 constexpr int kMissedForOffline = 2;
 constexpr uint16_t kPhotoChunk = 1000;
-constexpr const char* kFirmware = "0.6.0";
+constexpr const char* kFirmware = "0.6.1";
 constexpr uint32_t kDiagMs = 30000;
 constexpr uint32_t kWatchIntervalMs = 350;  // about three frames a second while the door is open
 constexpr uint32_t kWatchTailMs = 2000;     // and a little after it relocks
@@ -524,8 +524,20 @@ void handle_pin(const PinMsg& m) {
         ui_show_denied("Access denied", "Outside your access hours");
     } else if (resp.reason == Reason::Revoked) {
         ui_show_denied("Access denied", "This PIN has been revoked");
+    } else if (resp.reason == Reason::NoFace) {
+        ui_show_denied("Face not seen", "Look straight at the camera,\nthen enter your PIN again.");
+    } else if (resp.reason == Reason::FaceNotEnrolled) {
+        ui_show_denied("Face not enrolled", "This door needs your face and PIN.\nAsk your administrator to enrol your face.");
+    } else if (resp.reason == Reason::NoMatch) {
+        ui_show_denied("Face not recognised", "Your face did not match\nthe faces enrolled for this PIN.");
+    } else if (resp.reason == Reason::Mismatch) {
+        ui_show_denied("Access denied", "Face and PIN belong to\ndifferent people.");
+    } else if (resp.reason == Reason::WrongMode) {
+        ui_show_denied("Not accepted here", face_pin ? "This door needs your face and PIN." : "This door does not accept a PIN.");
+    } else if (resp.reason == Reason::DoorNotAllowed) {
+        ui_show_denied("Access denied", "You do not have access to this door");
     } else {
-        ui_show_denied("Access denied", face_pin ? "Face and PIN did not match" : "PIN not recognised");
+        ui_show_denied("Access denied", "PIN not recognised");
     }
     if (face_pin) {
         free(jpg);  // the face image already sent becomes this event's photo

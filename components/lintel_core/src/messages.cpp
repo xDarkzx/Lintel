@@ -24,6 +24,8 @@ const char* reason_name(Reason r) {
         case Reason::NoMatch: return "no-match";
         case Reason::WrongMode: return "wrong-mode";
         case Reason::Mismatch: return "mismatch";
+        case Reason::NoFace: return "no-face";
+        case Reason::FaceNotEnrolled: return "face-not-enrolled";
     }
     return "?";
 }
@@ -64,7 +66,7 @@ size_t encode(const AccessResp& m, uint8_t* out) {
 bool decode(const uint8_t* p, size_t len, AccessResp& m) {
     if (len != AccessResp::kLen) return false;
     if (p[4] > static_cast<uint8_t>(Decision::Grant)) return false;
-    if (p[5] > static_cast<uint8_t>(Reason::Mismatch)) return false;
+    if (p[5] > static_cast<uint8_t>(kLastReason)) return false;
     m.req_counter = get_u32(p);
     m.decision = static_cast<Decision>(p[4]);
     m.reason = static_cast<Reason>(p[5]);
@@ -217,7 +219,7 @@ size_t encode(const PinResp& m, uint8_t* out) {
 bool decode(const uint8_t* p, size_t len, PinResp& m) {
     if (len != PinResp::kLen) return false;
     if (p[4] > static_cast<uint8_t>(Decision::Grant)) return false;
-    if (p[5] > static_cast<uint8_t>(Reason::LockedOut)) return false;
+    if (p[5] > static_cast<uint8_t>(kLastReason)) return false;
     m.req_counter = get_u32(p);
     m.decision = static_cast<Decision>(p[4]);
     m.reason = static_cast<Reason>(p[5]);

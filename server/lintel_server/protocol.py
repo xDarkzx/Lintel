@@ -75,6 +75,8 @@ class Reason(IntEnum):
     NO_MATCH = 13
     WRONG_MODE = 14
     MISMATCH = 15
+    NO_FACE = 16
+    FACE_NOT_ENROLLED = 17
 
 
 class CredMode(IntEnum):
