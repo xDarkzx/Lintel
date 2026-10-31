@@ -237,7 +237,8 @@ async function runSearch() {
   box.innerHTML = (people.length ? `<div class="grp">People</div>` + people.slice(0, 6).map((p) =>
     `<a href="#" data-person="${p.id}"><span class="avatar">${initials(p.first_name + " " + p.last_name)}</span><span>${esc(p.first_name)} ${esc(p.last_name)}<br><small class="muted">${esc(p.department || p.email || "")}</small></span></a>`).join("") : "")
     + (ds.length ? `<div class="grp">Doors</div>` + ds.slice(0, 5).map((d) =>
-      `<a href="#" data-door="${d.id}"><span class="door-ico">${icon("door")}</span><span>${esc(d.name)}<br><small class="muted">Door ${d.id}${d.area ? " · " + esc(d.area) : ""}</small></span></a>`).join("") : "")
+      `<a href="#" data-door="${d.id}"><span class="door-ico">${icon("door")}</span><span>${esc(d.name)}<br><small class="muted">Door ${d.id}${d.area ? " · " + esc(d.area) : ""}</small></span></a>`
+      + (d.floor_id ? `<a href="#" data-locate="${d.id}"><span class="door-ico">${icon("map-pin")}</span><span>Locate ${esc(d.name)} on the map</span></a>` : "")).join("") : "")
     || `<div class="empty" style="padding:16px">No matches for “${esc(q)}”</div>`;
   box.classList.remove("hidden");
 }
@@ -245,6 +246,7 @@ $("#search-results").addEventListener("click", (e) => {
   const a = e.target.closest("a"); if (!a) return; e.preventDefault(); hideMenus(); $("#search").value = "";
   if (a.dataset.person) cardholderPanel(Number(a.dataset.person));
   if (a.dataset.door) doorPanel(Number(a.dataset.door));
+  if (a.dataset.locate) goMap(Number(a.dataset.locate));
 });
 
 // live updates
@@ -276,6 +278,8 @@ function onLive(msg) {
   if (["alarm", "alarms"].includes(msg.type)) { refreshBadges(); if ($("#queue")) loadQueue(current === "monitor"); }
   if (["doors", "devices"].includes(msg.type)) { setSys(); refreshBadges(); if (["monitor", "doors"].includes(current) && $("#panel").classList.contains("hidden")) render(); }
   if (msg.type === "mode") setMode(msg.mode);
+  // Live marker colours; never while a marker is being dragged or a drawer is open.
+  if (["maps", "doors", "alarm", "alarms"].includes(msg.type) && current === "maps" && !mapState.busy && $("#panel").classList.contains("hidden")) render();
   if (["diag", "media"].includes(msg.type) && panelState?.door === msg.door && panelState.tab === 2) panelState.refresh?.();
 }
 const trimRows = (body, n) => { while (body.children.length > n) body.lastElementChild.remove(); };
@@ -348,9 +352,9 @@ document.addEventListener("click", (e) => {
 // =====================================================================
 let current = "monitor";
 const PAGES = {};
-const TITLES = { monitor: "Monitor", alarms: "Alarms", activity: "Activity", cardholders: "Cardholders", groups: "Access groups", schedules: "Schedules", doors: "Doors & devices", operators: "Operators", settings: "Settings", audit: "Audit trail" };
+const TITLES = { monitor: "Monitor", alarms: "Alarms", activity: "Activity", cardholders: "Cardholders", groups: "Access groups", schedules: "Schedules", doors: "Doors & devices", maps: "Maps", operators: "Operators", settings: "Settings", audit: "Audit trail" };
 async function render() {
-  current = (location.hash || "#monitor").slice(1);
+  current = (location.hash || "#monitor").slice(1).split("?")[0];  // "#maps?door=3" is the maps page
   if (!PAGES[current]) current = "monitor";
   $$("#nav a").forEach((a) => a.classList.toggle("active", a.dataset.page === current));
   document.title = `${TITLES[current]} · Lintel Command`;
@@ -794,12 +798,14 @@ async function doorPanel(id) {
         <div class="card stat"><div><div class="label">Rejected frames</div><div class="value">${d.rejects}</div></div></div></div>
       ${canOperate() && d.serial ? `<div class="actions" style="margin:6px 0 4px"><button class="btn" id="unlock">${icon("lock-access")}Unlock door now</button>
         <span class="muted" style="font-size:12.5px">Releases the door once, as if a valid credential was used. Requires a reason; recorded against you.</span></div>` : ""}
+      ${d.floor_id ? `<div class="actions" style="margin:6px 0 4px"><button class="btn" id="locate">${icon("map-pin")}Locate on map</button></div>` : ""}
       <div class="section">Device</div>
       ${d.serial ? `<div class="kvs">${kv("Serial", `<span class="mono">${esc(d.serial)}</span>`)}${kv("MAC address", `<span class="mono">${esc(d.mac)}</span>`)}${kv("Firmware", esc(d.firmware))}${kv("Door controller", esc(d.controller))}${kv("Adopted", d.adopted_at ? fmtDate(d.adopted_at) : "—")}${kv("Last seen", ago(d.last_seen))}</div>`
         : emptyState("cpu", "No device", "Adopt a keypad into this door from Doors & devices.")}
       <div class="section">Access</div>
       <div class="kvs">${kv("Credentials accepted", MODE_LABEL[d.credential_mode] || "PIN")}${kv("Unlock time", `${d.unlock_ms / 1000} s`)}</div>
       <p class="muted" style="font-size:12.5px">${d.groups.length ? `Open to: ${d.groups.map((g) => `${esc(g.name)} (${esc(g.schedule)})`).join(", ")}` : "No access group includes this door yet."}</p>`;
+    $("#locate")?.addEventListener("click", () => { closePanel(); goMap(id); });
     $("#unlock")?.addEventListener("click", async () => {
       const reason = await dialog({ title: `Unlock ${d.name} now?`, tone: "warn", ic: "lock-access", confirm: "Unlock",
         text: "The door releases for its normal unlock time. Say why; the reason is stored in the audit trail.", input: { label: "Reason", placeholder: "e.g. courier at loading bay" } });
@@ -879,6 +885,199 @@ async function doorPanel(id) {
 }
 
 // ---------- operators ----------
+// ---------- maps ----------
+// Floor plans with every door on them. Admins place doors by dragging (or
+// click a door, then the plan) and lock them in place; anyone can search for
+// a door and be taken to it. Positions are fractions of the plan, so markers
+// stay put at any zoom.
+const mapState = { floor: null, zoom: null, edit: false, placing: null, busy: false };  // zoom null: fit the floor
+const pinStatus = (d, alarmed) => alarmed.has(d.id) ? "alarm" : d.online ? "ok" : "bad";
+const STATUS_TEXT = { ok: ["ok", "Online"], bad: ["bad", "Offline"], alarm: ["warn", "Active alarm"] };
+
+PAGES.maps = async (el) => {
+  const want = Number(new URLSearchParams(location.hash.split("?")[1] || "").get("door")) || null;
+  const [{ floors, doors }, alarms] = await Promise.all([api("/api/floors"), api("/api/alarms")]);
+  const alarmed = new Set(alarms.filter((a) => a.state === "active" && a.door_id).map((a) => a.door_id));
+  const target = want ? doors.find((d) => d.id === want) : null;
+  if (want && !target) toast("No such door", "bad");
+  else if (target && !target.floor_id) toast(`${target.name} is not on a map yet`, "bad");
+  else if (target) mapState.floor = target.floor_id;
+  if (!floors.some((f) => f.id === mapState.floor)) mapState.floor = floors[0]?.id ?? null;
+  const admin = isAdmin();
+  if (!admin) mapState.edit = false;
+  const fl = floors.find((f) => f.id === mapState.floor);
+  const floorName = Object.fromEntries(floors.map((f) => [f.id, f.name]));
+  const here = doors.filter((d) => fl && d.floor_id === fl.id);
+  const unplaced = doors.filter((d) => !d.floor_id);
+
+  const pin = (d) => `<button class="pin ${pinStatus(d, alarmed)} ${d.map_locked ? "locked" : ""}" data-pin="${d.id}" style="left:${d.map_x * 100}%;top:${d.map_y * 100}%" title="${esc(d.name)}">
+      <span class="pin-dot">${icon("door", "sm")}${d.map_locked && mapState.edit ? `<span class="pin-lock">${icon("lock")}</span>` : ""}</span><span class="pin-label">${esc(d.name)}</span></button>`;
+  const row = (d, extra = "") => `<button data-go="${d.id}" ${extra}><span class="dot ${STATUS_TEXT[pinStatus(d, alarmed)][0]}"></span>${esc(d.name)}<small>${d.floor_id ? esc(floorName[d.floor_id]) : `Door ${d.id}`}</small></button>`;
+
+  el.innerHTML = head("Maps", "Where every door is, floor by floor",
+    admin ? `${floors.length ? `<button id="edit" class="btn ${mapState.edit ? "primary" : ""}">${icon("pencil")}${mapState.edit ? "Done editing" : "Edit layout"}</button>` : ""}
+      <button id="add-floor" class="btn">${icon("plus")}Add floor</button>` : "")
+    + (!fl ? `<div class="card">${emptyState("map", "No floors yet", admin ? "Add a floor for each level of the building, upload its plan, then place the doors on it." : "An administrator can add the building's floor plans.")}</div>`
+    : `<div class="maps">
+      <div class="card maps-side"><div class="card-body stack" style="gap:12px">
+        <div class="find-wrap"><input id="map-find" placeholder="Find a door, e.g. G15E" autocomplete="off"><div id="find-results" class="find-results map-list hidden"></div></div>
+        <div class="floor-tabs">${floors.map((f) => `<button data-floor="${f.id}" class="${f.id === fl.id ? "on" : ""}"><b>${esc(f.name)}</b><small>Level ${f.level} · ${f.doors} door${f.doors === 1 ? "" : "s"}${f.has_plan ? "" : " · no plan"}</small></button>`).join("")}</div></div>
+        <div class="section">On ${esc(fl.name)}</div>
+        <div class="map-list">${here.map((d) => row(d)).join("") || `<div class="none">No doors placed here yet.</div>`}</div>
+        ${mapState.edit ? `<div class="section">Not on a map</div>
+          <div class="map-list" id="unplaced">${unplaced.map((d) => row(d, `draggable="true" class="${mapState.placing === d.id ? "on" : ""}"`)).join("") || `<div class="none">Every door is placed.</div>`}</div>
+          <p class="map-hint">Drag a door onto the plan, or click it and then click the plan. Drag a placed door to move it; lock it to stop it moving.</p>` : ""}
+      </div>
+      <div class="card maps-main">
+        <div class="card-head"><h2>${esc(fl.name)}${/level/i.test(fl.name) ? "" : ` <span class="muted" style="font-weight:500">Level ${fl.level}</span>`}</h2>
+          <div class="map-tools">
+            ${fl.has_plan ? `<button class="icon-btn" data-zoom="-1" title="Zoom out">${icon("minus")}</button><span class="zoom" id="zoom"></span><button class="icon-btn" data-zoom="1" title="Zoom in">${icon("plus")}</button><button class="icon-btn" data-zoom="0" title="Fit">${icon("current-location")}</button>` : ""}
+            ${admin ? `<label class="btn sm">${icon("upload", "sm")}${fl.has_plan ? "Replace plan" : "Upload plan"}<input type="file" accept="image/png,image/jpeg" id="plan-file" class="hidden"></label>
+              <button class="btn sm ghost" id="floor-edit">Rename</button><button class="btn sm ghost" id="floor-del">${icon("trash", "sm")}</button>` : ""}</div></div>
+        <div class="map-view" id="map-view">${fl.has_plan
+          ? `<div class="map-stage ${mapState.edit ? "editing" : ""}" id="stage"><img id="plan" src="/api/floors/${fl.id}/plan.png?w=${fl.width}" alt="${esc(fl.name)} floor plan">${here.map(pin).join("")}</div>`
+          : emptyState("map", "No plan for this floor yet", admin ? "Upload a floor plan image (PNG or JPEG) with the button above." : "An administrator can upload one.")}</div>
+      </div></div>`);
+
+  $("#add-floor")?.addEventListener("click", () => floorForm(null));
+  $("#edit")?.addEventListener("click", () => { mapState.edit = !mapState.edit; mapState.placing = null; render(); });
+  if (!fl) return;
+  $$("[data-floor]").forEach((b) => b.addEventListener("click", () => { mapState.floor = Number(b.dataset.floor); mapState.zoom = null; goMap(null); }));
+  $("#floor-edit")?.addEventListener("click", () => floorForm(fl));
+  $("#floor-del")?.addEventListener("click", async () => {
+    if (!await dialog({ title: `Delete ${fl.name}?`, tone: "bad", ic: "trash", danger: true, confirm: "Delete", text: "Its plan is deleted and its doors are taken off the map. The doors themselves are not affected." })) return;
+    try { await api(`/api/floors/${fl.id}`, { method: "DELETE" }); mapState.floor = null; render(); } catch (err) { fail(err); }
+  });
+  $("#plan-file")?.addEventListener("change", async (e) => {
+    const file = e.target.files[0]; if (!file) return;
+    try { await api(`/api/floors/${fl.id}/plan`, { method: "PUT", body: file, headers: { "Content-Type": file.type } }); toast("Plan uploaded"); render(); } catch (err) { fail(err); }
+  });
+
+  // finding a door, on any floor
+  const find = $("#map-find"), results = $("#find-results");
+  find.addEventListener("input", () => {
+    const q = find.value.trim().toLowerCase();
+    const hits = q ? doors.filter((d) => `${d.name} ${d.area} door ${d.id}`.toLowerCase().includes(q)).slice(0, 8) : [];
+    results.innerHTML = hits.map((d) => row(d)).join("") || (q ? `<div class="none">No door matches “${esc(find.value.trim())}”</div>` : "");
+    results.classList.toggle("hidden", !q);
+  });
+  find.addEventListener("keydown", (e) => { if (e.key === "Enter") $("[data-go]", results)?.click(); if (e.key === "Escape") { find.value = ""; results.classList.add("hidden"); } });
+  $$(".maps-side").forEach((side) => side.addEventListener("click", (e) => {
+    const b = e.target.closest("[data-go]"); if (!b || b.closest("#unplaced")) return;
+    const d = doors.find((x) => x.id === Number(b.dataset.go));
+    if (!d.floor_id) return toast(`${d.name} is not on a map yet`, "bad");
+    goMap(d.id);
+  }));
+
+  const stage = $("#stage");
+  if (!stage) return;
+  const pos = (e) => {
+    const r = $("#plan").getBoundingClientRect();
+    return { x: Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)), y: Math.min(1, Math.max(0, (e.clientY - r.top) / r.height)) };
+  };
+  const place = async (id, p) => {
+    try { await api(`/api/doors/${id}/location`, { method: "PUT", body: { floor_id: fl.id, x: p.x, y: p.y } }); } catch (err) { fail(err); }
+    mapState.placing = null; render();
+  };
+  // Zoom is a share of the view's width; "fit" shows the whole floor at once.
+  const view = $("#map-view");
+  const fitZoom = () => Math.min(1, (view.clientHeight - 24) / (view.clientWidth * (fl.height / fl.width)));
+  const applyZoom = () => {
+    const z = mapState.zoom ?? fitZoom();
+    stage.style.width = `${z * 100}%`; $("#zoom").textContent = `${Math.round(z * 100)}%`;
+  };
+  applyZoom();
+  $$("[data-zoom]").forEach((b) => b.addEventListener("click", () => {
+    const step = Number(b.dataset.zoom), z = mapState.zoom ?? fitZoom();
+    mapState.zoom = step === 0 ? null : Math.min(4, Math.max(0.25, z * (step > 0 ? 1.25 : 0.8)));
+    applyZoom();
+  }));
+
+  // placing doors that are not on a map yet: drag and drop, or click then click
+  $$("#unplaced [data-go]").forEach((b) => {
+    b.addEventListener("dragstart", (e) => e.dataTransfer.setData("text/plain", b.dataset.go));
+    b.addEventListener("click", () => { mapState.placing = mapState.placing === Number(b.dataset.go) ? null : Number(b.dataset.go);
+      $$("#unplaced [data-go]").forEach((x) => x.classList.toggle("on", Number(x.dataset.go) === mapState.placing));
+      stage.classList.toggle("placing", mapState.placing !== null); });
+  });
+  stage.addEventListener("dragover", (e) => { if (mapState.edit) { e.preventDefault(); stage.classList.add("drop"); } });
+  stage.addEventListener("dragleave", () => stage.classList.remove("drop"));
+  stage.addEventListener("drop", (e) => { e.preventDefault(); stage.classList.remove("drop"); const id = Number(e.dataTransfer.getData("text/plain")); if (id) place(id, pos(e)); });
+  stage.addEventListener("click", (e) => {
+    if (mapState.placing !== null && !e.target.closest(".pin")) place(mapState.placing, pos(e));
+    else if (!e.target.closest(".pin, .pin-pop")) $("#pin-pop")?.remove();
+  });
+
+  // placed doors: drag to move in edit mode (unless locked); click for details
+  $$(".pin", stage).forEach((p) => {
+    const d = here.find((x) => x.id === Number(p.dataset.pin));
+    let start = null, moved = false;
+    p.addEventListener("pointerdown", (e) => {
+      if (!mapState.edit || d.map_locked) return;
+      start = { x: e.clientX, y: e.clientY }; moved = false; p.setPointerCapture(e.pointerId);
+    });
+    p.addEventListener("pointermove", (e) => {
+      if (!start) return;
+      if (!moved && Math.hypot(e.clientX - start.x, e.clientY - start.y) < 4) return;
+      moved = true; mapState.busy = true; p.classList.add("dragging"); $("#pin-pop")?.remove();
+      const q = pos(e); p.style.left = `${q.x * 100}%`; p.style.top = `${q.y * 100}%`;
+    });
+    p.addEventListener("pointerup", (e) => {
+      if (start && moved) { start = null; mapState.busy = false; place(d.id, pos(e)); return; }
+      start = null; showPin(d);
+    });
+  });
+
+  function showPin(d) {
+    $("#pin-pop")?.remove();
+    const [tone, text] = STATUS_TEXT[pinStatus(d, alarmed)];
+    // Doors near the top of a plan open their card below the marker, so it is never cut off.
+    stage.insertAdjacentHTML("beforeend", `<div class="pin-pop ${d.map_y < 0.35 ? "below" : ""}" id="pin-pop" style="left:${d.map_x * 100}%;top:${d.map_y * 100}%">
+      <h4>${esc(d.name)}</h4><p>Door ${d.id}${d.area ? " · " + esc(d.area) : ""} · ${MODE_LABEL[d.credential_mode] || "PIN"}</p>
+      <div class="actions"><span class="badge ${tone}"><span class="dot ${tone}"></span>${text}</span>${d.map_locked ? `<span class="badge">${icon("lock", "sm")}Locked in place</span>` : ""}</div>
+      <div class="actions" style="margin-top:10px"><button class="btn sm primary" data-pop="open">Door details</button>
+        ${admin ? `<button class="btn sm" data-pop="lock">${icon(d.map_locked ? "lock-open" : "lock", "sm")}${d.map_locked ? "Unlock" : "Lock in place"}</button>
+          ${d.map_locked ? "" : `<button class="btn sm ghost" data-pop="remove">Remove</button>`}` : ""}</div></div>`);
+    $("#pin-pop").addEventListener("click", async (e) => {
+      const b = e.target.closest("[data-pop]"); if (!b) return;
+      try {
+        if (b.dataset.pop === "open") doorPanel(d.id);
+        if (b.dataset.pop === "lock") { await api(`/api/doors/${d.id}/location/lock`, { method: "PUT", body: { locked: !d.map_locked } }); toast(d.map_locked ? `${d.name} unlocked` : `${d.name} locked in place`); render(); }
+        if (b.dataset.pop === "remove") { await api(`/api/doors/${d.id}/location`, { method: "PUT", body: { floor_id: null } }); render(); }
+      } catch (err) { fail(err); }
+    });
+  }
+
+  if (target && target.floor_id === fl.id) {
+    const p = $(`.pin[data-pin="${target.id}"]`, stage);
+    const reveal = () => { p.classList.add("found"); p.scrollIntoView({ block: "center", inline: "center", behavior: "smooth" }); showPin(target); };
+    $("#plan").complete ? reveal() : $("#plan").addEventListener("load", reveal, { once: true });
+  }
+};
+
+// Opens the maps on a door's floor with the door highlighted.
+function goMap(doorId) {
+  const hash = doorId ? `#maps?door=${doorId}` : "#maps";
+  if (location.hash === hash) render(); else location.hash = hash;
+}
+
+function floorForm(fl) {
+  openPanel(panelShell({ avatar: `<span class="door-ico">${icon("map")}</span>`, title: fl ? `Rename ${esc(fl.name)}` : "Add floor", sub: "Floors are listed lowest level first" }));
+  $("#panel-content").innerHTML = `<form id="ff" class="stack"><div class="row2">
+      <label class="field"><span>Name</span><input name="name" required maxlength="40" value="${esc(fl?.name || "")}" placeholder="Ground floor"></label>
+      <label class="field"><span>Level</span><input name="level" type="number" min="-10" max="200" value="${fl ? fl.level : 0}"><small>0 for ground, negative for basements</small></label></div>
+    <div class="actions" style="justify-content:flex-end"><button class="btn primary">${fl ? "Save" : "Add floor"}</button></div></form>`;
+  $("#ff").addEventListener("submit", async (e) => {
+    e.preventDefault(); const f = new FormData(e.target);
+    const body = { name: f.get("name").trim(), level: Number(f.get("level")) };
+    try {
+      const r = await api(fl ? `/api/floors/${fl.id}` : "/api/floors", { method: fl ? "PATCH" : "POST", body });
+      if (!fl) mapState.floor = r.id;
+      closePanel(); render();
+    } catch (err) { fail(err); }
+  });
+}
+
 PAGES.operators = async (el) => {
   const ops = await api("/api/operators");
   el.innerHTML = head("Operators", "Viewers watch; operators also handle alarms and site mode; admins configure everything",

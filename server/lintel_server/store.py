@@ -140,6 +140,16 @@ CREATE TABLE IF NOT EXISTS holidays (
     name TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS floors (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    level INTEGER NOT NULL DEFAULT 0,   -- display order, lowest first
+    plan TEXT,                          -- file in data/plans, re-encoded on upload
+    width INTEGER,
+    height INTEGER,
+    created REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS face_templates (
     id INTEGER PRIMARY KEY,
     cardholder_id INTEGER NOT NULL REFERENCES cardholders(id) ON DELETE CASCADE,
@@ -266,7 +276,13 @@ class Store:
                                     ("operators", "totp_last_step", "INTEGER NOT NULL DEFAULT 0"),
                                     ("operators", "last_login", "REAL"),
                                     ("sessions", "last_seen", "REAL"),
-                                    ("schedules", "observe_holidays", "INTEGER")):
+                                    ("schedules", "observe_holidays", "INTEGER"),
+                                    # Where the door is on a floor plan: fractions of the plan's width
+                                    # and height, so markers stay put whatever size the plan is shown at.
+                                    ("doors", "floor_id", "INTEGER REFERENCES floors(id) ON DELETE SET NULL"),
+                                    ("doors", "map_x", "REAL"),
+                                    ("doors", "map_y", "REAL"),
+                                    ("doors", "map_locked", "INTEGER NOT NULL DEFAULT 0")):
             cols = {r["name"] for r in self.q(f"PRAGMA table_info({table})")}
             if column not in cols:
                 self.x(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")

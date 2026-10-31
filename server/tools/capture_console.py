@@ -100,6 +100,9 @@ def main(out: Path, base: str) -> None:
         page.click(".tabs button:nth-child(2)"); page.wait_for_selector(".cred-row"); shot("console-cardholder-credentials", 2)
         page.keyboard.press("Escape")
         page.goto(f"{base}/#schedules"); page.wait_for_selector(".week"); shot("console-schedules")
+        placed = page.evaluate("fetch('/api/floors').then(r => r.json()).then(j => (j.doors.find(d => d.floor_id) || {}).id)")
+        if placed:  # the maps page, located on whichever door is on a plan
+            page.goto(f"{base}/#maps?door={placed}"); page.wait_for_selector("#plan"); shot("console-maps", 2.5)
         page.goto(f"{base}/#audit"); page.click("#run"); page.wait_for_selector(".verify b:has-text('Chain')"); shot("console-audit")
         page.evaluate("document.documentElement.dataset.theme='dark'")
         page.goto(f"{base}/#monitor"); page.wait_for_selector("#stats .stat"); shot("console-monitor-dark")

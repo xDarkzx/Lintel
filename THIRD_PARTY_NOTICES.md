@@ -11,6 +11,7 @@ which continue to apply to them.
 | esp_cam_sensor (Espressif) | `firmware/panel/components/espressif__esp_cam_sensor` | Apache-2.0, [LICENSE](firmware/panel/components/espressif__esp_cam_sensor/LICENSE) |
 | Inter typeface (The Inter Project Authors) | `server/lintel_server/static/fonts`, `firmware/panel/main/fonts/inter_*.c` | SIL Open Font License 1.1, [licenses/Inter-OFL-1.1.txt](licenses/Inter-OFL-1.1.txt) |
 | Silent-Face anti-spoofing models (Minivision), converted to ONNX | `server/antispoof` | Apache-2.0, [LICENSE](server/antispoof/LICENSE-Silent-Face-Anti-Spoofing.txt) |
+| Demo floor plans (HABS NY-6086-M, US National Park Service) | `docs/demo/floor-plans` | Public domain, see [README](docs/demo/floor-plans/README.md) |
 | Tabler Icons (Paweł Kuna) | `server/lintel_server/static/icons.svg`, `firmware/panel/main/fonts/icons_*.c` | MIT, [licenses/Tabler-Icons-MIT.txt](licenses/Tabler-Icons-MIT.txt) |
 
 Dependencies fetched at build time (ESP-IDF components listed in

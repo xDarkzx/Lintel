@@ -13,6 +13,7 @@ settings shield-check user-shield search lock lock-open logout chevron-down chev
 refresh power eye download plus trash key nfc face-id fingerprint id-badge-2 cpu temperature clock
 plug-connected plug-connected-x sun moon filter user-scan building activity device-desktop arrows-exchange
 shield-lock dots user broadcast info-circle circle-check circle-x hourglass report history lock-access
+map map-pin upload minus pencil current-location
 """.split()
 
 
