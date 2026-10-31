@@ -88,8 +88,19 @@ def test_bulk_import(env):
     assert names["Ana"]["groups"] == [gid] and not names["Ana"]["has_pin"]
 
 
-def test_webhook_must_be_https(env):
+def fake_dns(monkeypatch, table):
+    """Resolves the test host names to chosen addresses, so no real DNS is used."""
+    import socket
+    def getaddrinfo(host, port, *a, **kw):
+        if host not in table:
+            raise socket.gaierror("unknown host")
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, port)) for ip in table[host]]
+    monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
+
+
+def test_webhook_must_be_https(env, monkeypatch):
     store, ctl, client, panel, gid = env
+    fake_dns(monkeypatch, {"hooks.example": ["93.184.216.34"]})
     assert client.put("/api/settings/webhook", json={"url": "http://internal:8080/x"}).status_code == 422
     assert client.put("/api/settings/webhook", json={"url": "https://hooks.example/abc", "min_priority": 2}).status_code == 200
     assert client.get("/api/settings/webhook").json()["min_priority"] == 2

@@ -46,7 +46,14 @@ trusted only for its own door. The server is the only place decisions are made.
 | Session theft, CSRF, clickjacking | `__Host-` HttpOnly SameSite=Strict cookie, Origin checks, 30 min idle timeout, CSP `frame-ancestors 'none'` | `test_cross_origin_writes_are_refused`, `test_security_headers_present` |
 | Server impersonation to controllers | Controllers pin the server certificate's SHA-256 | door controller `post()` |
 | Fake controller on the LAN | Controller endpoints require the site token; door photos also carry a per-door HMAC | `test_controller_endpoints_need_the_token` |
-| Malicious uploads | Image dimension limit before decode; 2–8 MB caps; JPEG/PNG only | `test_image_bomb_rejected_before_decoding` |
+| Exhausting memory with huge requests | Request bodies over 25 MB refused before any handler reads them, declared or streamed | `test_oversized_bodies_are_refused_before_they_are_read` |
+| A signed-out or disabled operator still watching live events | The live feed re-checks its session every 30 s and closes when it ends, without counting as activity | `test_the_live_feed_ends_when_the_session_does` |
+| Using the alarm webhook to reach internal systems (SSRF) | HTTPS only; every resolved address must be public; the connection goes to the checked address; redirects refused | `test_the_webhook_cannot_be_aimed_at_internal_addresses` |
+| Replaying door frames | Frames for a burst already analysed are refused, so a controller cannot resend old footage | `test_a_door_frame_sent_twice_at_once_is_counted_once` |
+| Brute force from many threads at once | The sign-in throttle is locked, so simultaneous wrong passwords all count | `test_simultaneous_wrong_passwords_all_count` |
+| Slow or growing memory under attack | Throttle, face-result and enrolment state are bounded and expire; memory stays flat over hundreds of entries | `test_resilience.py` |
+| Malformed or forged protocol bytes | Every decoder and the frame and adoption openers are fuzzed with over half a million inputs under AddressSanitizer and UBSan | `Fuzz.*` |
+| Malicious uploads | Image dimension limit before decode, including keypad face images; 2–8 MB caps; JPEG/PNG only; floor plans re-encoded | `test_image_bomb_rejected_before_decoding` |
 | CSV formula injection | Exported cells starting with `= + - @` are neutralised | `test_csv_export_neutralises_formulas` |
 | Locking everyone out | The last admin cannot be deleted, demoted or disabled | `test_last_admin_cannot_be_removed_or_demoted` |
 | Losing the server | Encrypted backup (scrypt + AES-256-GCM); restore verifies the chain and refuses path escapes | `test_backup.py` |

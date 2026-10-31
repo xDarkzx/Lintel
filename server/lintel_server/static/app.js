@@ -52,7 +52,7 @@ const ago = (ts) => {
 };
 const hhmm = (m) => `${String(Math.floor(m / 60) % 24).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
 const parseHHMM = (s) => { const [h, m] = s.split(":").map(Number); return h * 60 + m; };
-const initials = (name) => (name || "?").split(/\s+/).filter(Boolean).slice(0, 2).map((p) => p[0].toUpperCase()).join("");
+const initials = (name) => esc((name || "?").split(/\s+/).filter(Boolean).slice(0, 2).map((p) => p[0].toUpperCase()).join(""));
 const isAdmin = () => ME?.role === "admin";
 const canOperate = () => ME && ME.role !== "viewer";
 const fmtBytes = (n) => n == null ? "—" : n > 1048576 ? `${(n / 1048576).toFixed(1)} MB` : `${Math.round(n / 1024)} KB`;
