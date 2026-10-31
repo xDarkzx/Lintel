@@ -1,4 +1,13 @@
 menu "Lintel panel"
+    config PANEL_LOCK_GPIO
+        int "Lock relay output GPIO (-1 = none)"
+        default 49
+        help
+            Drives a relay or MOSFET for the door strike. JP1 pin 13 on the
+            Guition JC4880P443C. Fail-secure: low (locked) at power-up and reset.
+    config PANEL_LOCK_ACTIVE_HIGH
+        bool "Lock output is active high"
+        default y
     config PANEL_DOOR_NAME
         string "Door name shown on the panel"
         default "Main Entrance"

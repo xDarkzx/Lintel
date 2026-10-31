@@ -1,0 +1,43 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  core:
+    name: C++ core (GoogleTest, ASan/UBSan)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - run: cmake -S test/host -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DLINTEL_SANITIZE=ON
+      - run: cmake --build build
+      - run: ctest --test-dir build --output-on-failure
+
+  server:
+    name: Server (pytest, pip-audit)
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements-dev.txt pip-audit
+      - run: python -m pytest -q tests
+      - run: pip-audit -r requirements.txt
+
+  panel:
+    name: Keypad firmware (ESP-IDF 5.4)
+    runs-on: ubuntu-24.04
+    container: espressif/idf:v5.4.2
+    steps:
+      - uses: actions/checkout@v4
+      - run: . $IDF_PATH/export.sh && idf.py -C firmware/panel set-target esp32p4 build
+        shell: bash

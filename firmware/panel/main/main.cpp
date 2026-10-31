@@ -11,6 +11,7 @@
 #include <sys/time.h>
 
 #include "camera.h"
+#include "driver/gpio.h"
 #include "driver/temperature_sensor.h"
 #include "esp_heap_caps.h"
 #include "identity.h"
@@ -238,6 +239,42 @@ void send_photo(uint32_t req_ctr, uint8_t* jpg, size_t n) {
     free(jpg);
 }
 
+// ---- lock output ---------------------------------------------------------------------
+
+esp_timer_handle_t s_relock = nullptr;
+
+void lock_set(bool release) {
+#if CONFIG_PANEL_LOCK_GPIO >= 0
+    int level = release ? 1 : 0;
+#if !CONFIG_PANEL_LOCK_ACTIVE_HIGH
+    level = !level;
+#endif
+    gpio_set_level(static_cast<gpio_num_t>(CONFIG_PANEL_LOCK_GPIO), level);
+#endif
+    ESP_LOGI(TAG, "lock %s", release ? "RELEASED" : "secured");
+}
+
+void lock_begin() {
+#if CONFIG_PANEL_LOCK_GPIO >= 0
+    gpio_config_t o = {};
+    o.pin_bit_mask = 1ULL << CONFIG_PANEL_LOCK_GPIO;
+    o.mode = GPIO_MODE_OUTPUT;
+    gpio_config(&o);
+#endif
+    lock_set(false);  // fail-secure from the first instruction
+    esp_timer_create_args_t t = {};
+    t.callback = [](void*) { lock_set(false); };
+    t.name = "relock";
+    esp_timer_create(&t, &s_relock);
+}
+
+// Releases the strike for `ms`, then relocks. A new grant restarts the timer.
+void lock_release_for(uint32_t ms) {
+    esp_timer_stop(s_relock);
+    lock_set(true);
+    esp_timer_start_once(s_relock, static_cast<uint64_t>(ms) * 1000);
+}
+
 // ---- maintenance ------------------------------------------------------------------
 
 void send_media(uint8_t kind, const char* label, uint32_t ref, const uint8_t* jpg, size_t n) {
@@ -281,6 +318,7 @@ void run_command(PanelCommand cmd, uint32_t id) {
             break;
         case PanelCommand::Unlock:
             ESP_LOGW(TAG, "door released remotely");
+            lock_release_for(5000);
             ui_show_granted("Door unlocked", "Released by the security desk", 5000);
             break;
         case PanelCommand::Screenshot: {
@@ -376,7 +414,9 @@ void handle_pin(const PinMsg& m) {
     if (resp.decision == Decision::Grant) {
         char title[40];
         std::snprintf(title, sizeof(title), "Welcome%s%s", resp.name[0] ? ", " : "", resp.name);
-        ui_show_granted(title, "Door unlocked", resp.unlock_ms ? resp.unlock_ms : 5000);
+        uint32_t unlock = resp.unlock_ms ? resp.unlock_ms : 5000;
+        lock_release_for(unlock);
+        ui_show_granted(title, "Door unlocked", unlock);
     } else if (resp.reason == Reason::LockedOut) {
         ui_show_lockout(resp.lockout_s ? resp.lockout_s : 30);
     } else if (resp.reason == Reason::Lockdown) {
@@ -516,6 +556,7 @@ void console_begin() {
 
 extern "C" void app_main(void) {
     using namespace panel;
+    lock_begin();
     lintel::kv_init();
     setenv("TZ", "NZST-12NZDT,M9.5.0,M4.1.0/3", 1);  // New Zealand, with daylight saving
     tzset();
