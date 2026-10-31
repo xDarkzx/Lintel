@@ -6,7 +6,9 @@ are. Each defence listed here has a test that fails if it is removed.
 ## Assets
 
 - **Door keys** (AES-128, one per door): whoever holds one can speak for that door.
-- **The PIN pepper** (HMAC key in `secrets.json`): turns PINs and card UIDs into tags.
+- **The PIN pepper** (HMAC key in `secrets.json`, wrapped by the master key): turns PINs and card UIDs into tags.
+- **The master key**: wraps the data key that encrypts door keys, two-factor secrets, face templates and the
+  webhook URL at rest. Kept outside the data folder in production.
 - **The audit key**: makes the journal tamper-evident.
 - **Cardholder data and entry photos**: personal information.
 - **Operator accounts**: control over who gets in.
@@ -39,7 +41,7 @@ trusted only for its own door. The server is the only place decisions are made.
 | A shared or stolen PIN | On PIN doors, a clear face unlike every face enrolled for that PIN raises a P3 alarm; face + PIN doors refuse it outright | `test_someone_else_using_a_pin_raises_an_alarm`, `test_face_and_pin_door_needs_the_pin_owners_face` |
 | Bypassing a door's credential mode | Every request, including a bare PIN, is checked against what the door accepts | `test_a_bare_pin_respects_the_doors_mode` |
 | Coercion | Duress PIN grants normally and raises a silent P1 alarm | `test_duress_grants_silently_but_raises_critical_alarm` |
-| Stolen database | PINs and card UIDs stored as HMAC tags keyed outside the database | `test_backup_restores_a_working_site` |
+| Stolen database | PINs and card UIDs stored as HMAC tags keyed outside the database; door keys, two-factor secrets, face templates and the webhook URL encrypted (AES-256-GCM, envelope) and bound to their row; deleted values zeroed and pre-encryption leftovers scrubbed from disk | `test_vault.py` |
 | Editing history | HMAC-SHA256 hash chain; photo hashes are chained too | `test_journal_detects_tampering`, `Audit.*` |
 | Operator password guessing | 5 failures lock name and address for 15 min with an alarm; constant-time for unknown users | `test_operator_two_factor_and_login_lockout` |
 | Stolen operator password | TOTP second factor, single-use codes, optional admin enforcement | `test_operator_two_factor_and_login_lockout` |

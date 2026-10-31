@@ -329,7 +329,7 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
         if ok and r["totp_secret"]:
             if not body.code:
                 return {"mfa_required": True}
-            step = totp_verify(r["totp_secret"], body.code)
+            step = totp_verify(store.totp_secret(r["id"], r["totp_secret"]), body.code)
             ok = step is not None and step > r["totp_last_step"]  # each code works once
             if ok:
                 store.x("UPDATE operators SET totp_last_step=? WHERE id=?", (step, r["id"]))
@@ -380,14 +380,15 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
         step = totp_verify(secret, body.code) if secret else None
         if step is None:
             raise HTTPException(400, "that code does not match; check the time on your phone")
-        store.x("UPDATE operators SET totp_secret=?, totp_last_step=? WHERE id=?", (secret, step, op["id"]))
+        store.x("UPDATE operators SET totp_secret=?, totp_last_step=? WHERE id=?",
+                (store.seal_totp(op["id"], secret), step, op["id"]))
         store.x("DELETE FROM settings WHERE key=?", (f"pending_totp:{op['id']}",))
         journal(op, "operator.mfa_enabled", "two-factor sign-in turned on")
         return {"ok": True}
 
     @app.post("/api/me/mfa/disable")
     def mfa_disable(body: CodeIn, op: dict = Depends(viewer)) -> dict:
-        if not op["totp_secret"] or totp_verify(op["totp_secret"], body.code) is None:
+        if not op["totp_secret"] or totp_verify(store.totp_secret(op["id"], op["totp_secret"]), body.code) is None:
             raise HTTPException(400, "a current code is required to turn two-factor off")
         store.x("UPDATE operators SET totp_secret=NULL WHERE id=?", (op["id"],))
         journal(op, "operator.mfa_disabled", "two-factor sign-in turned off")
@@ -532,7 +533,7 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
         key = secrets.token_bytes(16)
         try:
             store.x("INSERT INTO doors(id, name, area, key, unlock_ms, key_created) VALUES(?, ?, ?, ?, ?, ?)",
-                    (body.id, body.name, body.area, key, body.unlock_ms, time.time()))
+                    (body.id, body.name, body.area, store.seal_door_key(body.id, key), body.unlock_ms, time.time()))
         except sqlite3.IntegrityError:
             raise HTTPException(409, f"door {body.id} already exists")
         ctl.load_door(body.id)
@@ -545,7 +546,7 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
     def rekey(door_id: int, op: dict = Depends(admin)) -> dict:
         key = secrets.token_bytes(16)
         if store.x("UPDATE doors SET key=?, tx_ceiling=0, rx_highest=0, key_created=? WHERE id=?",
-                   (key, time.time(), door_id)) == 0:
+                   (store.seal_door_key(door_id, key), time.time(), door_id)) == 0:
             raise HTTPException(404, "no such door")
         ctl.load_door(door_id)
         dev = store.q1("SELECT * FROM devices WHERE door_id=?", (door_id,))
@@ -562,7 +563,7 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
             return
         key = secrets.token_bytes(16)
         store.x("UPDATE doors SET key=?, tx_ceiling=0, rx_highest=0, key_created=? WHERE id=?",
-                (key, time.time(), door_id))
+                (store.seal_door_key(door_id, key), time.time(), door_id))
         ctl.load_door(door_id)
         queue_blob(dev, door_id, key)
         ev = store.journal("door.rekeyed", door_id=door_id, operator="system",
@@ -853,7 +854,7 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
 
     def templates() -> list[tuple[int, Any]]:
         import numpy as np
-        return [(r["cardholder_id"], np.frombuffer(r["embedding"], dtype=np.float32))
+        return [(r["cardholder_id"], np.frombuffer(store.template(r["cardholder_id"], r["embedding"]), dtype=np.float32))
                 for r in store.q("SELECT t.cardholder_id, t.embedding FROM face_templates t "
                                  "JOIN cardholders c ON c.id = t.cardholder_id WHERE c.active=1")]
 
@@ -871,7 +872,7 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
         if other is not None:
             raise HTTPException(409, f"this face already matches another cardholder ({score:.2f})")
         store.x("INSERT INTO face_templates(cardholder_id, embedding, source, created) VALUES(?, ?, ?, ?)",
-                (cid, r.embedding.tobytes(), source, time.time()))
+                (cid, store.seal_template(cid, r.embedding.tobytes()), source, time.time()))
         journal(op, "cardholder.face_enrolled", f"face template added from {source}", cardholder_id=cid)
         n = store.q1("SELECT COUNT(*) n FROM face_templates WHERE cardholder_id=?", (cid,))["n"]
         return {"ok": True, "faces": n, "detect_score": round(r.detect_score, 3)}
@@ -911,7 +912,7 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
             return
         for emb in embs:
             store.x("INSERT INTO face_templates(cardholder_id, embedding, source, created) VALUES(?, ?, ?, ?)",
-                    (e.cardholder_id, emb.tobytes(), "live enrolment", time.time()))
+                    (e.cardholder_id, store.seal_template(e.cardholder_id, emb.tobytes()), "live enrolment", time.time()))
         live_scores = [s for s in e.real_scores if s >= REAL_MIN]
         journal(op, "cardholder.face_enrolled",
                 f"guided enrolment with liveness: {len(embs)} templates, steps {' > '.join(e.steps)}, "
@@ -1509,9 +1510,11 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
         key = secrets.token_bytes(16)
         if door is None:
             store.x("INSERT INTO doors(id, name, area, key, unlock_ms) VALUES(?, ?, ?, ?, ?)",
-                    (body.door_id, body.name or f"Door {body.door_id}", body.area, key, body.unlock_ms))
+                    (body.door_id, body.name or f"Door {body.door_id}", body.area,
+                     store.seal_door_key(body.door_id, key), body.unlock_ms))
         else:
-            store.x("UPDATE doors SET key=?, tx_ceiling=0, rx_highest=0 WHERE id=?", (key, body.door_id))
+            store.x("UPDATE doors SET key=?, tx_ceiling=0, rx_highest=0 WHERE id=?",
+                    (store.seal_door_key(body.door_id, key), body.door_id))
         for g in body.groups:
             store.x("INSERT OR IGNORE INTO access_group_doors(group_id, door_id) VALUES(?, ?)", (g, body.door_id))
         store.x("UPDATE devices SET door_id=?, adopted_at=? WHERE serial=?", (body.door_id, time.time(), serial))
@@ -1529,7 +1532,8 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
             raise HTTPException(404, "no device on this door")
         # Rotate the door key so the detached panel's old key is worthless,
         # and tell the panel to forget its assignment.
-        store.x("UPDATE doors SET key=?, tx_ceiling=0, rx_highest=0 WHERE id=?", (secrets.token_bytes(16), door_id))
+        store.x("UPDATE doors SET key=?, tx_ceiling=0, rx_highest=0 WHERE id=?",
+                (store.seal_door_key(door_id, secrets.token_bytes(16)), door_id))
         store.x("UPDATE devices SET door_id=NULL, adopted_at=NULL WHERE serial=?", (dev["serial"],))
         queue_blob(store.q1("SELECT * FROM devices WHERE serial=?", (dev["serial"],)), 0, bytes(16))
         ctl.load_door(door_id)

@@ -163,7 +163,7 @@ def test_a_face_already_enrolled_for_someone_else_is_refused(en):
     store, client, panel, faces, live, ana = en
     other = next(c["id"] for c in client.get("/api/cardholders").json() if c["first_name"] == "Zed")
     store.x("INSERT INTO face_templates(cardholder_id, embedding, source, created) VALUES(?, ?, 'upload', ?)",
-            (other, ANA.tobytes(), time.time()))
+            (other, store.seal_template(other, ANA.tobytes()), time.time()))
     s = client.post(f"/api/cardholders/{ana}/faces/enrolment").json()
     out = run_steps(client, faces, s["id"], s["steps"])
     assert out["state"] == "failed" and "another cardholder" in out["message"]
@@ -216,7 +216,7 @@ def wait_alarm(client, kind, timeout=3.0):
 
 def enrol_template(store, cid, emb):
     store.x("INSERT INTO face_templates(cardholder_id, embedding, source, created) VALUES(?, ?, 'live enrolment', ?)",
-            (cid, emb.tobytes(), time.time()))
+            (cid, store.seal_template(cid, emb.tobytes()), time.time()))
 
 
 def test_someone_else_using_a_pin_raises_an_alarm(en):
