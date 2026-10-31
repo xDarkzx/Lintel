@@ -7,7 +7,6 @@
 #include "bsp/display.h"
 #include "bsp/esp-bsp.h"
 #include "esp_log.h"
-#include "esp_random.h"
 #include "lvgl.h"
 
 namespace panel {
@@ -70,25 +69,19 @@ int s_len = 0;
 bool s_busy = false;
 bool s_lockdown = false;
 uint32_t s_lockout_left = 0;
-uint8_t s_digits[10] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 0};
+const uint8_t s_digits[10] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 0};
 
 lv_style_t s_key_style;
 lv_style_t s_key_pressed;
 
 // Key slots: 0-8 are the top three rows, 9 = backspace, 10 = last digit,
-// 11 = enter. Digit positions are reshuffled for every entry so finger
-// positions and smudges give nothing away.
+// 11 = enter.
 constexpr int kKeyBack = 9;
 constexpr int kKeyLastDigit = 10;
 constexpr int kKeyEnter = 11;
 
-void shuffle_digits() {
-    for (int i = 9; i > 0; --i) {
-        int j = static_cast<int>(esp_random() % static_cast<uint32_t>(i + 1));
-        uint8_t t = s_digits[i];
-        s_digits[i] = s_digits[j];
-        s_digits[j] = t;
-    }
+// Standard phone-style layout: 1-2-3 / 4-5-6 / 7-8-9 / back-0-enter.
+void label_digits() {
     char buf[2] = {0, 0};
     for (int k = 0; k < 9; ++k) {
         buf[0] = static_cast<char>('0' + s_digits[k]);
@@ -112,18 +105,17 @@ void render_dots() {
     }
 }
 
-void reset_entry(bool reshuffle) {
+void reset_entry() {
     std::memset(s_pin, 0, sizeof(s_pin));
     s_len = 0;
     s_busy = false;
     lv_label_set_text(s_prompt, s_lockdown ? "Security PIN required" : "Enter your PIN");
     lv_obj_set_style_text_color(s_prompt, lv_color_hex(s_lockdown ? kRed : kMuted), 0);
-    if (reshuffle) shuffle_digits();
     render_dots();
 }
 
 void idle_cb(lv_timer_t*) {
-    if (s_len > 0 && !s_busy) reset_entry(true);
+    if (s_len > 0 && !s_busy) reset_entry();
 }
 
 void clock_cb(lv_timer_t*) {
@@ -161,7 +153,7 @@ void hide_overlay(lv_timer_t* t) {
     lv_obj_add_flag(s_overlay, LV_OBJ_FLAG_HIDDEN);
     lv_timer_del(t);
     s_overlay_timer = nullptr;
-    reset_entry(true);
+    reset_entry();
 }
 
 void bar_anim(void* obj, int32_t v) { lv_bar_set_value(static_cast<lv_obj_t*>(obj), v, LV_ANIM_OFF); }
@@ -419,7 +411,7 @@ void lockout_tick(lv_timer_t* t) {
         lv_timer_del(t);
         s_lockout_timer = nullptr;
         lv_obj_add_flag(s_overlay, LV_OBJ_FLAG_HIDDEN);
-        reset_entry(true);
+        reset_entry();
     }
 }
 
@@ -464,7 +456,8 @@ void ui_begin(const char* door_name, SubmitFn on_submit, void* ctx) {
     s_idle_timer = lv_timer_create(idle_cb, kIdleClearMs, nullptr);
     lv_timer_create(clock_cb, 1000, nullptr);
     clock_cb(nullptr);
-    reset_entry(true);
+    label_digits();
+    reset_entry();
     bsp_display_unlock();
     ESP_LOGI(TAG, "keypad up");
 }
@@ -494,7 +487,7 @@ void ui_set_lockdown(bool on) {
     } else {
         lv_obj_add_flag(s_banner, LV_OBJ_FLAG_HIDDEN);
     }
-    if (!s_busy) reset_entry(false);
+    if (!s_busy) reset_entry();
     bsp_display_unlock();
 }
 
