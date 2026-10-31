@@ -48,7 +48,10 @@ def create_backup(data_dir: Path, db: sqlite3.Connection, passphrase: str, inclu
         dst.close()
         with tarfile.open(fileobj=buf, mode="w:gz") as tar:
             tar.add(snap, arcname="lintel.db")
-            for rel in ("secrets.json", "tls/server.crt", "tls/server.key"):
+            # The keyring is useless without the master key. master.key exists only when the
+            # key is kept beside the data (development); a key from LINTEL_MASTER_KEY_FILE never
+            # enters a backup, and restoring needs that same key.
+            for rel in ("secrets.json", "keyring.json", "master.key", "tls/server.crt", "tls/server.key"):
                 if (data_dir / rel).exists():
                     tar.add(data_dir / rel, arcname=rel)
             if (data_dir / "plans").exists():  # floor plans are site configuration, always kept
@@ -94,7 +97,7 @@ def restore_backup(blob: bytes, passphrase: str, data_dir: Path, force: bool = F
                 restored.append(m.name)
     for wal in ("lintel.db-wal", "lintel.db-shm"):
         (data_dir / wal).unlink(missing_ok=True)  # stale journal files from the old database
-    for rel in ("secrets.json", "tls/server.key"):
+    for rel in ("secrets.json", "keyring.json", "master.key", "tls/server.key"):
         try:
             os.chmod(data_dir / rel, 0o600)
         except OSError:

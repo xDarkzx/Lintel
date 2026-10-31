@@ -87,7 +87,7 @@ class Controller:
             return
         old = self.doors.get(door_id)
         # Resume from the persisted ceiling: values below it may have been used.
-        self.doors[door_id] = DoorLink(r["id"], r["name"], bytes(r["key"]), r["unlock_ms"],
+        self.doors[door_id] = DoorLink(r["id"], r["name"], self.store.door_key(r["id"], r["key"]), r["unlock_ms"],
                                        ReplayWindow(r["rx_highest"]), max(1, r["tx_ceiling"]), r["tx_ceiling"],
                                        online=old.online if old else False, last_seen=old.last_seen if old else 0.0)
 

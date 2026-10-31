@@ -20,9 +20,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .vault import TEXT_PREFIX, Vault, is_sealed
+
 SCHEMA = """
 PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
+-- Deleted and overwritten values are zeroed on disk, not left in free pages:
+-- a removed cardholder, a changed PIN or a replaced key must not be recoverable.
+PRAGMA secure_delete=ON;
 
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 
@@ -200,21 +205,30 @@ class Secrets:
     controller_token: str = ""  # door controllers present this on every HTTP call
 
     @staticmethod
-    def load_or_create(path: Path) -> "Secrets":
+    def load_or_create(path: Path, vault: Vault) -> "Secrets":
+        """The pepper and audit key are kept wrapped by the master key, so the
+        file on its own reveals neither. Older files with them in the clear
+        are rewritten wrapped."""
         if path.exists():
             d = json.loads(path.read_text())
-            s = Secrets(int(d["net_id"], 16), bytes.fromhex(d["pepper"]), bytes.fromhex(d["audit_key"]),
-                        d.get("controller_token", ""))
-            if s.controller_token:
+            pepper = (vault.open("secrets.pepper", bytes.fromhex(d["pepper_enc"])) if "pepper_enc" in d
+                      else bytes.fromhex(d["pepper"]))
+            audit = (vault.open("secrets.audit_key", bytes.fromhex(d["audit_key_enc"])) if "audit_key_enc" in d
+                     else bytes.fromhex(d["audit_key"]))
+            s = Secrets(int(d["net_id"], 16), pepper, audit, d.get("controller_token", ""))
+            if s.controller_token and "pepper_enc" in d and "audit_key_enc" in d:
                 return s
-            s.controller_token = secrets.token_urlsafe(32)  # upgrade an older secrets file
+            s.controller_token = s.controller_token or secrets.token_urlsafe(32)  # upgrade an older secrets file
         else:
             s = Secrets(secrets.randbits(32), secrets.token_bytes(32), secrets.token_bytes(32),
                         secrets.token_urlsafe(32))
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"net_id": f"{s.net_id:08x}", "pepper": s.pepper.hex(),
-                                    "audit_key": s.audit_key.hex(), "controller_token": s.controller_token},
-                                   indent=2))
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"net_id": f"{s.net_id:08x}",
+                                   "pepper_enc": vault.seal("secrets.pepper", s.pepper).hex(),
+                                   "audit_key_enc": vault.seal("secrets.audit_key", s.audit_key).hex(),
+                                   "controller_token": s.controller_token}, indent=2))
+        os.replace(tmp, path)
         try:
             os.chmod(path, 0o600)
         except OSError:
@@ -227,13 +241,15 @@ class Store:
         self.data_dir = data_dir
         data_dir.mkdir(parents=True, exist_ok=True)
         (data_dir / "photos").mkdir(exist_ok=True)
-        self.secrets = Secrets.load_or_create(data_dir / "secrets.json")
+        self.vault = Vault(data_dir)
+        self.secrets = Secrets.load_or_create(data_dir / "secrets.json", self.vault)
         self._db = sqlite3.connect(data_dir / "lintel.db", check_same_thread=False, isolation_level=None)
         self._db.row_factory = sqlite3.Row
         self._db.executescript(SCHEMA)
         self._lock = threading.RLock()
         self._migrate()
         self._seed()
+        self._encrypt_at_rest()
         # Round-the-clock schedules ignore holidays; everything else closes on them.
         self.x("UPDATE schedules SET observe_holidays = CASE WHEN name='24/7' THEN 0 ELSE 1 END "
                "WHERE observe_holidays IS NULL")
@@ -257,13 +273,93 @@ class Store:
         with self._lock:
             self._db.backup(dst)
 
+    @staticmethod
+    def _secret_setting(key: str) -> bool:
+        # Webhook URLs carry their own access token; pending TOTP secrets are second factors.
+        return key == "alarm_webhook" or key.startswith("pending_totp:")
+
     def setting(self, key: str, default: str = "") -> str:
         r = self.q1("SELECT value FROM settings WHERE key=?", (key,))
-        return r["value"] if r else default
+        if r is None:
+            return default
+        if self._secret_setting(key) and r["value"]:
+            return self.vault.open_text(f"settings.{key}", r["value"])
+        return r["value"]
 
     def set_setting(self, key: str, value: str) -> None:
+        if self._secret_setting(key) and value:
+            value = self.vault.seal_text(f"settings.{key}", value)
         self.x("INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                (key, value))
+
+    # ---- secrets at rest -------------------------------------------------------------------
+    # Each value is bound to its row, so it cannot be moved to another record.
+
+    def seal_door_key(self, door_id: int, key: bytes) -> bytes:
+        return self.vault.seal(f"doors.key.{door_id}", key)
+
+    def door_key(self, door_id: int, blob: bytes) -> bytes:
+        return self.vault.open(f"doors.key.{door_id}", blob)
+
+    def seal_totp(self, operator_id: int, secret: str) -> str:
+        return self.vault.seal_text(f"operators.totp_secret.{operator_id}", secret)
+
+    def totp_secret(self, operator_id: int, value: str) -> str:
+        return self.vault.open_text(f"operators.totp_secret.{operator_id}", value)
+
+    def seal_template(self, cardholder_id: int, embedding: bytes) -> bytes:
+        return self.vault.seal(f"face_templates.embedding.{cardholder_id}", embedding)
+
+    def template(self, cardholder_id: int, blob: bytes) -> bytes:
+        return self.vault.open(f"face_templates.embedding.{cardholder_id}", blob)
+
+    def _encrypt_at_rest(self) -> None:
+        """Encrypts values written in the clear by older versions, in one
+        transaction so a crash cannot leave some encrypted and some not."""
+        n = 0
+        with self._lock:
+            db = self._db
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                for r in db.execute("SELECT id, key FROM doors").fetchall():
+                    if not is_sealed(r["key"]):
+                        db.execute("UPDATE doors SET key=? WHERE id=?",
+                                   (self.seal_door_key(r["id"], bytes(r["key"])), r["id"]))
+                        n += 1
+                for r in db.execute("SELECT id, totp_secret FROM operators WHERE totp_secret IS NOT NULL").fetchall():
+                    if not r["totp_secret"].startswith(TEXT_PREFIX):
+                        db.execute("UPDATE operators SET totp_secret=? WHERE id=?",
+                                   (self.seal_totp(r["id"], r["totp_secret"]), r["id"]))
+                        n += 1
+                for r in db.execute("SELECT id, cardholder_id, embedding FROM face_templates").fetchall():
+                    if not is_sealed(r["embedding"]):
+                        db.execute("UPDATE face_templates SET embedding=? WHERE id=?",
+                                   (self.seal_template(r["cardholder_id"], bytes(r["embedding"])), r["id"]))
+                        n += 1
+                for r in db.execute("SELECT key, value FROM settings").fetchall():
+                    if self._secret_setting(r["key"]) and r["value"] and not r["value"].startswith(TEXT_PREFIX):
+                        db.execute("UPDATE settings SET value=? WHERE key=?",
+                                   (self.vault.seal_text(f"settings.{r['key']}", r["value"]), r["key"]))
+                        n += 1
+                db.execute("COMMIT")
+            except BaseException:
+                db.execute("ROLLBACK")
+                raise
+        if n:
+            self.journal("system.encrypted_at_rest", operator="system",
+                         detail=f"{n} stored secrets encrypted with the site master key")
+        if n or self.setting("storage_scrubbed") != "1":
+            self._scrub()
+            self.set_setting("storage_scrubbed", "1")
+
+    def _scrub(self) -> None:
+        """Rewrites the database file and empties the write-ahead log, so
+        plaintext left in free pages by older versions is gone from disk.
+        Encrypting a value in place does not erase its old bytes; this does."""
+        with self._lock:
+            self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            self._db.execute("VACUUM")
+            self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
     def _migrate(self) -> None:
         """Additive column changes for databases created by older versions."""

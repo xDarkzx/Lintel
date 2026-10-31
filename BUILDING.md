@@ -21,10 +21,53 @@ The console is at `https://<host>:8443`. On first start the server writes to
 | `initial_admin.txt` | First administrator's user name and password. Sign in, enable two-factor, then delete the file. |
 | `tls/` | Self-signed P-256 certificate. Replace with your own for production. |
 | `controller.env` | Site token and certificate pin for door controllers. |
-| `secrets.json` | Credential pepper and audit chain key. Back it up; it is not in the database. |
+| `secrets.json` | Credential pepper and audit chain key, wrapped by the master key. |
+| `keyring.json` | The data key that encrypts door keys, two-factor secrets, face templates and the webhook URL, wrapped by the master key. |
+| `master.key` | Development only: the master key, created when none is supplied. Production keeps it out of this folder (below). |
 
-`server/data/` is never committed. Ports: 8443/tcp (HTTPS console and
-controller uploads) and 47800/udp (sealed keypad traffic).
+`server/data/` is never committed.
+
+### Master key
+
+Door keys, operators' two-factor secrets, face templates and the alarm
+webhook URL are encrypted in the database with a data key, which is stored
+only wrapped by a master key. Anyone who copies the database or a disk
+snapshot without the master key gets ciphertext.
+
+In development the server creates `data/master.key` and logs a warning: a key
+beside the data protects only against a leaked database file. In production
+supply it from outside the data folder, as a Docker secret or a file a KMS or
+TPM unlocks at boot:
+
+```sh
+openssl rand -base64 32 > lintel_master_key        # keep it off the server's disk if you can
+```
+
+```yaml
+# compose.yaml
+services:
+  lintel:
+    secrets: [lintel_master_key]
+    environment:
+      LINTEL_MASTER_KEY_FILE: /run/secrets/lintel_master_key
+secrets:
+  lintel_master_key:
+    file: ./lintel_master_key
+```
+
+Rotate it with the server stopped; only `keyring.json` is rewritten:
+
+```sh
+python -m lintel_server rotate-master-key --new-key-file new_master_key
+```
+
+A wrong master key stops the server; there is no unencrypted fallback.
+Backups include the keyring, and include `master.key` only when the key is
+kept beside the data, so restoring a production backup needs the same master
+key.
+
+Ports: 8443/tcp (HTTPS console and controller uploads) and 47800/udp (sealed keypad
+traffic).
 
 To run outside Docker, use a virtual environment:
 

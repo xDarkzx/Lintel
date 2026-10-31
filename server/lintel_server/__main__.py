@@ -112,17 +112,47 @@ def restore(args) -> None:
         raise SystemExit(2)
 
 
+def rotate_master_key(args) -> None:
+    """Rewraps the site's data keys under a new master key. The current key is
+    read the usual way (LINTEL_MASTER_KEY_FILE, LINTEL_MASTER_KEY or
+    data/master.key); the new one from --new-key-file. Stop the server first."""
+    import base64
+
+    from .vault import KEY_LEN, Vault, VaultError
+    if not args.new_key_file:
+        raise SystemExit("usage: python -m lintel_server rotate-master-key --new-key-file <file> [--data DIR]")
+    try:
+        new = base64.b64decode(Path(args.new_key_file).read_bytes().strip(), validate=True)
+    except ValueError:
+        raise SystemExit("the new master key must be base64")
+    if len(new) != KEY_LEN:
+        raise SystemExit(f"the new master key must be {KEY_LEN} bytes")
+    try:
+        vault = Vault(Path(args.data))
+    except VaultError as e:
+        raise SystemExit(f"cannot open the keyring with the current master key: {e}")
+    vault.rewrap(new)
+    beside = Path(args.data) / "master.key"
+    if beside.exists() and not os.environ.get("LINTEL_MASTER_KEY_FILE") and not os.environ.get("LINTEL_MASTER_KEY"):
+        beside.write_text(base64.b64encode(new).decode() + "\n")
+    print(f"keyring rewrapped under the new master key ({vault.source} replaced); no data was re-encrypted")
+
+
 def main() -> None:
     p = argparse.ArgumentParser(prog="lintel_server")
-    p.add_argument("command", nargs="?", default="serve", choices=["serve", "restore"])
+    p.add_argument("command", nargs="?", default="serve", choices=["serve", "restore", "rotate-master-key"])
     p.add_argument("file", nargs="?", help="restore: the .lbk backup file")
     p.add_argument("--force", action="store_true", help="restore: replace an existing database")
+    p.add_argument("--new-key-file", help="rotate-master-key: file holding the new base64 master key")
     p.add_argument("--data", default=os.environ.get("LINTEL_DATA", "data"))
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--http-port", type=int, default=int(os.environ.get("LINTEL_HTTPS_PORT", "8443")))
     p.add_argument("--udp-port", type=int, default=int(os.environ.get("LINTEL_UDP_PORT", "47800")))
     a = p.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    if a.command == "rotate-master-key":
+        rotate_master_key(a)
+        return
     if a.command == "restore":
         if not a.file:
             raise SystemExit("usage: python -m lintel_server restore <backup.lbk> [--data DIR] [--force]")

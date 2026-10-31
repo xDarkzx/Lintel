@@ -11,6 +11,9 @@ services:
       - ./data:/data
     environment:
       TZ: Pacific/Auckland
+      # Production: keep the master key out of ./data, as a Docker secret (see BUILDING.md).
+      # LINTEL_MASTER_KEY_FILE: /run/secrets/lintel_master_key
+    # secrets: [lintel_master_key]
     # Least privilege: nothing writable but /data, no capabilities, no setuid.
     read_only: true
     tmpfs:
