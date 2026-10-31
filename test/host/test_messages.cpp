@@ -53,7 +53,8 @@ TEST(Messages, HeartbeatAndAckRoundTrip) {
     EXPECT_EQ(g.uptime_s, 123456u);
     EXPECT_EQ(g.pending_events, 3);
 
-    HeartbeatAck a{SiteMode::Lockdown, 9, 1700000000u, 55, CredMode::CardAndPin, "Back Door"};
+    HeartbeatAck a{SiteMode::Lockdown, 9, 1700000000u, 55, CredMode::CardAndPin, "Back Door",
+                   PanelCommand::Reboot, 4242};
     encode(a, buf);
     HeartbeatAck ga{};
     ASSERT_TRUE(decode(buf, HeartbeatAck::kLen, ga));
@@ -61,6 +62,8 @@ TEST(Messages, HeartbeatAndAckRoundTrip) {
     EXPECT_EQ(ga.hb_counter, 55u);
     EXPECT_EQ(ga.cred_mode, CredMode::CardAndPin);
     EXPECT_STREQ(ga.door_name, "Back Door");
+    EXPECT_EQ(ga.command, PanelCommand::Reboot);
+    EXPECT_EQ(ga.command_id, 4242u);
     buf[0] = 7;
     EXPECT_FALSE(decode(buf, HeartbeatAck::kLen, ga));
 }
@@ -180,4 +183,25 @@ TEST(Messages, CredReqFaceNeedsReference) {
     EXPECT_TRUE(decode(buf, CredReq::kLen, g));
     buf[0] = 0;  // nothing presented
     EXPECT_FALSE(decode(buf, CredReq::kLen, g));
+}
+
+TEST(Messages, DiagRoundTrip) {
+    Diag d{};
+    std::memcpy(d.firmware, "0.4.0", 5);
+    d.uptime_s = 3600;
+    d.reset_reason = 3;
+    d.heap_internal = 123456;
+    d.heap_psram = 30000000;
+    d.temp_c = -5;
+    d.camera = 1;
+    d.link_errors = 7;
+    d.last_decision_ms = 42;
+    uint8_t buf[64];
+    ASSERT_EQ(encode(d, buf), Diag::kLen);
+    Diag g{};
+    ASSERT_TRUE(decode(buf, Diag::kLen, g));
+    EXPECT_EQ(std::string(g.firmware, 5), "0.4.0");
+    EXPECT_EQ(g.temp_c, -5);
+    EXPECT_EQ(g.heap_psram, 30000000u);
+    EXPECT_EQ(g.last_decision_ms, 42);
 }

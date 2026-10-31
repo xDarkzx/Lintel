@@ -55,12 +55,6 @@ void camera_task(void*) {
         ESP_LOGE(TAG, "camera open failed; entry photos disabled");
         vTaskDelete(nullptr);
     }
-    jpeg_encode_engine_cfg_t eng = {};
-    eng.timeout_ms = 400;
-    if (jpeg_new_encoder_engine(&eng, &s_jpeg) != ESP_OK) {
-        ESP_LOGE(TAG, "JPEG engine init failed; entry photos disabled");
-        vTaskDelete(nullptr);
-    }
     app_video_register_frame_operation_cb(frame_cb);
     if (app_video_stream_task_start(fd, 1, nullptr) != ESP_OK) {
         ESP_LOGE(TAG, "camera stream start failed; entry photos disabled");
@@ -74,10 +68,48 @@ void camera_task(void*) {
 }  // namespace
 
 void camera_begin() {
+    jpeg_encode_engine_cfg_t eng = {};
+    eng.timeout_ms = 400;
+    if (jpeg_new_encoder_engine(&eng, &s_jpeg) != ESP_OK) ESP_LOGE(TAG, "JPEG engine init failed");
     s_want = xSemaphoreCreateBinary();
     s_ready = xSemaphoreCreateBinary();
     s_busy = xSemaphoreCreateMutex();
     xTaskCreate(camera_task, "camera", 6144, nullptr, 4, nullptr);
+}
+
+bool camera_running() { return s_running; }
+
+bool jpeg_encode_rgb565(const uint8_t* rgb, uint32_t w, uint32_t h, size_t len, uint8_t** out, size_t* out_len,
+                        int quality) {
+    if (s_jpeg == nullptr) return false;
+    xSemaphoreTake(s_busy, portMAX_DELAY);
+    jpeg_encode_memory_alloc_cfg_t mem = {};
+    mem.buffer_direction = JPEG_ENC_ALLOC_OUTPUT_BUFFER;
+    jpeg_encode_memory_alloc_cfg_t in_mem = {};
+    in_mem.buffer_direction = JPEG_ENC_ALLOC_INPUT_BUFFER;
+    size_t cap = 0, in_cap = 0;
+    auto* buf = static_cast<uint8_t*>(jpeg_alloc_encoder_mem(len, &mem, &cap));
+    auto* in = static_cast<uint8_t*>(jpeg_alloc_encoder_mem(len, &in_mem, &in_cap));
+    bool ok = false;
+    if (buf != nullptr && in != nullptr) {
+        std::memcpy(in, rgb, len);  // the encoder needs DMA-capable, aligned input
+        jpeg_encode_cfg_t cfg = {};
+        cfg.src_type = JPEG_ENCODE_IN_FORMAT_RGB565;
+        cfg.sub_sample = JPEG_DOWN_SAMPLING_YUV444;
+        cfg.image_quality = static_cast<uint32_t>(quality);
+        cfg.width = w;
+        cfg.height = h;
+        uint32_t n = 0;
+        ok = jpeg_encoder_process(s_jpeg, &cfg, in, len, buf, cap, &n) == ESP_OK && n > 0;
+        if (ok) {
+            *out = buf;
+            *out_len = n;
+        }
+    }
+    if (!ok) free(buf);
+    free(in);
+    xSemaphoreGive(s_busy);
+    return ok;
 }
 
 bool camera_snapshot(uint8_t** out, size_t* len, uint32_t timeout_ms) {

@@ -22,6 +22,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 import serial
 from serial.tools import list_ports
@@ -43,6 +44,10 @@ PHOTO_START = 0x86
 PHOTO_CHUNK = 0x87
 PHOTO_END = 0x88
 ANNOUNCE = 0x89
+MEDIA_START = 0x8A  # u8 kind (1 screenshot, 2 test photo), u32 ref, u32 size, mac[32]
+MEDIA_CHUNK = 0x8B
+MEDIA_END = 0x8C
+MEDIA_KINDS = {1: "screenshot", 2: "test_photo"}
 
 MAX_PAYLOAD = 1024
 MAX_PHOTO = 2_000_000
@@ -119,6 +124,8 @@ class DoorController:
         self.photo: dict | None = None
         self.stats = {"up": 0, "down": 0, "photos": 0}
         self.name = socket.gethostname()
+        self.media: dict | None = None
+        self.local_media = Path("panel_media")
 
     # ---- panel side -----------------------------------------------------------
 
@@ -140,6 +147,19 @@ class DoorController:
             self.door_id = door or None
         elif ptype == ANNOUNCE and len(p) > 32:
             threading.Thread(target=self.announce, args=(p,), daemon=True).start()
+        elif ptype == MEDIA_START and len(p) == 41:
+            kind, ref, size = struct.unpack_from("<BII", p)
+            if kind in MEDIA_KINDS and size <= 3_000_000:
+                self.media = {"kind": MEDIA_KINDS[kind], "req": ref, "size": size, "mac": p[9:41].hex(),
+                              "data": bytearray()}
+        elif ptype == MEDIA_CHUNK and self.media is not None:
+            self.media["data"] += p
+        elif ptype == MEDIA_END and self.media is not None:
+            m, self.media = self.media, None
+            if len(m["data"]) == m["size"]:
+                threading.Thread(target=self.upload_media, args=(m,), daemon=True).start()
+            else:
+                log.warning("%s truncated, dropped", m["kind"])
         elif ptype == PHOTO_START and len(p) == 40:
             req, size = struct.unpack_from("<II", p)
             if size <= MAX_PHOTO:
@@ -182,6 +202,20 @@ class DoorController:
             log.info("%s is waiting for adoption in the dashboard", body["serial"])
         if state in ("assigned", "unassigned"):
             self.send_panel(SERVER_STATE, bytes([1 if state == "assigned" else 0]))
+
+    def upload_media(self, m: dict) -> None:
+        self.local_media.mkdir(exist_ok=True)
+        local = self.local_media / f"door{self.door_id}_{m['kind']}.jpg"
+        local.write_bytes(bytes(m["data"]))
+        req = urllib.request.Request(f"{self.http}/api/door/{self.door_id}/media?kind={m['kind']}",
+                                     data=bytes(m["data"]), method="POST",
+                                     headers={"Content-Type": "image/jpeg", "X-Lintel-Req": str(m["req"]),
+                                              "X-Lintel-Mac": m["mac"]})
+        try:
+            with urllib.request.urlopen(req, timeout=10):
+                log.info("%s from door %s stored (%d bytes, local copy %s)", m["kind"], self.door_id, m["size"], local)
+        except (urllib.error.HTTPError, OSError) as e:
+            log.error("%s upload failed: %s", m["kind"], e)
 
     def upload_photo(self, ph: dict) -> None:
         if self.door_id is None:

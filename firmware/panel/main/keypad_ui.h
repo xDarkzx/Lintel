@@ -2,6 +2,7 @@
 // All functions are safe to call from any task; they take the display lock.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 namespace panel {
@@ -13,6 +14,10 @@ void ui_begin(const char* door_name, SubmitFn on_submit, void* ctx);
 void ui_set_link(bool wired, bool server, int rssi);
 void ui_set_lockdown(bool on);
 void ui_set_door_name(const char* name);
+void ui_set_cred_mode(uint8_t mode);  // lintel::CredMode
+void ui_identify(uint32_t ms);
+// RGB565 copy of the whole screen in PSRAM; caller frees. nullptr on failure.
+uint8_t* ui_snapshot(uint32_t* w, uint32_t* h, size_t* len);
 
 // Result of a submitted PIN. `title` / `detail` are shown on the overlay.
 void ui_show_granted(const char* title, const char* detail, uint32_t unlock_ms);

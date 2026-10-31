@@ -34,6 +34,7 @@ LinkFrameFn s_on_provision = nullptr;
 LinkFrameFn s_on_state = nullptr;
 void* s_ctx = nullptr;
 volatile bool s_dtr = false;
+volatile uint32_t s_errors = 0;
 char s_hello[96] = {};
 
 enum class St { M0, M1, Type, Len0, Len1, Payload, Crc0, Crc1 };
@@ -101,6 +102,7 @@ void feed(uint8_t b) {
                 dispatch(s_type, s_payload, s_len);
             } else {
                 ESP_LOGW(TAG, "crc mismatch, dropped type 0x%02x", s_type);
+                ++s_errors;
             }
             s_st = St::M0;
             break;
@@ -171,5 +173,7 @@ void usb_link_send(uint8_t type, const uint8_t* payload, uint16_t len) {
 }
 
 bool usb_link_host_connected() { return s_dtr; }
+
+uint32_t usb_link_errors() { return s_errors; }
 
 }  // namespace panel

@@ -53,3 +53,6 @@ CONFIG_TINYUSB_CDC_ENABLED=y
 
 # app_main hands off to its tasks; give the idle task room to clean it up
 CONFIG_FREERTOS_IDLE_TASK_STACKSIZE=4096
+
+# Screenshots for remote diagnostics
+CONFIG_LV_USE_SNAPSHOT=y

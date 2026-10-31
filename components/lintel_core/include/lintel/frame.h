@@ -34,6 +34,7 @@ enum class MsgType : uint8_t {
     PinReq = 8,        // keypad -> controller: a PIN was entered
     PinResp = 9,       // controller -> keypad: decision bound to one PinReq/CredReq
     CredReq = 10,      // keypad -> controller: card, PIN, face reference, or a combination
+    Diag = 11,         // keypad -> controller: health telemetry
 };
 
 enum class Dir : uint8_t {

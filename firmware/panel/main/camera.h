@@ -14,4 +14,10 @@ void camera_begin();
 // caller frees with free(). Returns false if the camera is not running.
 bool camera_snapshot(uint8_t** out, size_t* len, uint32_t timeout_ms);
 
+bool camera_running();
+
+// Hardware JPEG encode of an RGB565 buffer (used for screenshots too).
+bool jpeg_encode_rgb565(const uint8_t* rgb, uint32_t w, uint32_t h, size_t len, uint8_t** out, size_t* out_len,
+                        int quality);
+
 }  // namespace panel

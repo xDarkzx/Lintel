@@ -101,6 +101,8 @@ size_t encode(const HeartbeatAck& m, uint8_t* out) {
     put_u32(out + 7, m.hb_counter);
     out[11] = static_cast<uint8_t>(m.cred_mode);
     std::memcpy(out + 12, m.door_name, sizeof(m.door_name));
+    out[36] = static_cast<uint8_t>(m.command);
+    put_u32(out + 37, m.command_id);
     return HeartbeatAck::kLen;
 }
 
@@ -115,6 +117,9 @@ bool decode(const uint8_t* p, size_t len, HeartbeatAck& m) {
     m.cred_mode = static_cast<CredMode>(p[11]);
     std::memcpy(m.door_name, p + 12, sizeof(m.door_name));
     m.door_name[sizeof(m.door_name) - 1] = 0;
+    if (p[36] > static_cast<uint8_t>(PanelCommand::TestPhoto)) return false;
+    m.command = static_cast<PanelCommand>(p[36]);
+    m.command_id = get_u32(p + 37);
     return true;
 }
 
@@ -254,6 +259,39 @@ bool decode(const uint8_t* p, size_t len, CredReq& m) {
         if (i < m.pin_len ? !digit : m.pin[i] != 0) return false;
     }
     return ((m.present & kCredFace) != 0) == (m.face_ref != 0);
+}
+
+size_t encode(const Diag& m, uint8_t* out) {
+    std::memcpy(out, m.firmware, 8);
+    put_u32(out + 8, m.uptime_s);
+    out[12] = m.reset_reason;
+    put_u32(out + 13, m.heap_internal);
+    put_u32(out + 17, m.heap_internal_min);
+    put_u32(out + 21, m.heap_psram);
+    out[25] = static_cast<uint8_t>(m.temp_c);
+    out[26] = m.camera;
+    out[27] = m.reader;
+    put_u16(out + 28, m.link_errors);
+    put_u16(out + 30, m.rejected);
+    put_u16(out + 32, m.last_decision_ms);
+    return Diag::kLen;
+}
+
+bool decode(const uint8_t* p, size_t len, Diag& m) {
+    if (len != Diag::kLen) return false;
+    std::memcpy(m.firmware, p, 8);
+    m.uptime_s = get_u32(p + 8);
+    m.reset_reason = p[12];
+    m.heap_internal = get_u32(p + 13);
+    m.heap_internal_min = get_u32(p + 17);
+    m.heap_psram = get_u32(p + 21);
+    m.temp_c = static_cast<int8_t>(p[25]);
+    m.camera = p[26];
+    m.reader = p[27];
+    m.link_errors = get_u16(p + 28);
+    m.rejected = get_u16(p + 30);
+    m.last_decision_ms = get_u16(p + 32);
+    return true;
 }
 
 }  // namespace lintel

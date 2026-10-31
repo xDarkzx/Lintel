@@ -30,6 +30,9 @@ constexpr uint8_t kLinkPhotoStart = 0x86;  // u32 req_counter, u32 length, u8 ma
 constexpr uint8_t kLinkPhotoChunk = 0x87;  // raw JPEG bytes, in order
 constexpr uint8_t kLinkPhotoEnd = 0x88;
 constexpr uint8_t kLinkAnnounce = 0x89;    // pubkey[32] then "serial=.. mac=.. fw=.. door=N seq=N"
+constexpr uint8_t kLinkMediaStart = 0x8A;  // u8 kind (1 screenshot, 2 test photo), u32 ref, u32 size, mac[32]
+constexpr uint8_t kLinkMediaChunk = 0x8B;
+constexpr uint8_t kLinkMediaEnd = 0x8C;
 
 using LinkFrameFn = void (*)(const uint8_t* frame, size_t len, void* ctx);
 
@@ -37,5 +40,6 @@ void usb_link_start(const char* hello, LinkFrameFn on_frame, LinkFrameFn on_prov
                     void* ctx);
 void usb_link_send(uint8_t type, const uint8_t* payload, uint16_t len);
 bool usb_link_host_connected();
+uint32_t usb_link_errors();
 
 }  // namespace panel

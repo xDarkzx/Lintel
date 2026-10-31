@@ -33,6 +33,7 @@ class MsgType(IntEnum):
     PIN_REQ = 8
     PIN_RESP = 9
     CRED_REQ = 10
+    DIAG = 11
 
 
 class Dir(IntEnum):
@@ -41,7 +42,7 @@ class Dir(IntEnum):
     BROADCAST = 2
 
 
-_UPLINK = {MsgType.ACCESS_REQ, MsgType.HEARTBEAT, MsgType.EVENT, MsgType.PIN_REQ, MsgType.CRED_REQ}
+_UPLINK = {MsgType.ACCESS_REQ, MsgType.HEARTBEAT, MsgType.EVENT, MsgType.PIN_REQ, MsgType.CRED_REQ, MsgType.DIAG}
 
 
 def dir_for(t: MsgType) -> Dir:
@@ -207,10 +208,44 @@ class HeartbeatAck:
     hb_counter: int
     cred_mode: CredMode = CredMode.PIN
     door_name: str = ""
+    command: int = 0
+    command_id: int = 0
 
     def encode(self) -> bytes:
         name = self.door_name.encode()[:23].ljust(24, b"\x00")
-        return struct.pack("<BHIIB", self.mode, self.cache_version, self.time, self.hb_counter, self.cred_mode) + name
+        return (struct.pack("<BHIIB", self.mode, self.cache_version, self.time, self.hb_counter, self.cred_mode) + name
+                + struct.pack("<BI", self.command, self.command_id))
+
+
+COMMANDS = {"reboot": 1, "identify": 2, "screenshot": 3, "test_photo": 4}
+RESET_REASONS = {0: "unknown", 1: "power-on", 2: "external pin", 3: "software restart", 4: "crash (panic)",
+                 5: "interrupt watchdog", 6: "task watchdog", 7: "other watchdog", 8: "deep sleep", 9: "brownout",
+                 10: "SDIO", 11: "USB", 12: "JTAG", 13: "eFuse", 14: "power glitch", 15: "CPU lockup"}
+
+
+@dataclass
+class Diag:
+    firmware: str
+    uptime_s: int
+    reset_reason: str
+    heap_internal: int
+    heap_internal_min: int
+    heap_psram: int
+    temp_c: int | None
+    camera: bool
+    reader: bool
+    link_errors: int
+    rejected: int
+    last_decision_ms: int
+
+    @staticmethod
+    def decode(p: bytes) -> "Diag":
+        if len(p) != 34:
+            raise FrameError("Diag length")
+        fw = p[:8].rstrip(b"\x00").decode(errors="replace")
+        up, rr, hi, hmin, hp, temp, cam, rdr, le, rej, dec = struct.unpack_from("<IBIIIbBBHHH", p, 8)
+        return Diag(fw, up, RESET_REASONS.get(rr, str(rr)), hi, hmin, hp, None if temp == -128 else temp,
+                    bool(cam), bool(rdr), le, rej, dec)
 
 
 CRED_CARD, CRED_PIN, CRED_FACE = 1, 2, 4

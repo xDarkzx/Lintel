@@ -76,7 +76,7 @@ function eventRow(e, fresh = false) {
 }
 
 document.addEventListener("click", (ev) => {
-  const img = ev.target.closest(".ev-thumb img");
+  const img = ev.target.closest(".ev-thumb img, .shot img");
   if (img) {
     const lb = $("#lightbox");
     $("img", lb).src = img.src;
@@ -90,7 +90,7 @@ document.addEventListener("click", (ev) => {
 });
 
 function openDrawer(html) { $("#drawer-body").innerHTML = html; $("#drawer").classList.remove("hidden"); }
-function closeDrawer() { $("#drawer").classList.add("hidden"); }
+function closeDrawer() { $("#drawer").classList.add("hidden"); openDoorId = null; }
 
 // ---------- auth ----------
 function showLogin() { $("#app").classList.add("hidden"); $("#login").classList.remove("hidden"); }
@@ -130,6 +130,7 @@ function onLive(msg) {
   if (msg.type === "doors" || msg.type === "devices") { refreshKpis(); if (current === "doors" && $("#drawer").classList.contains("hidden")) render(); }
   if (msg.type === "devices" && current !== "doors" && isAdmin()) api("/api/devices").then((ds) => { const n = ds.filter((d) => d.door_id == null).length; if (n) toast(`${n} unassigned device${n > 1 ? "s" : ""} waiting — see Doors`); });
   if (msg.type === "mode") setModeUi(msg.mode);
+  if ((msg.type === "media" || msg.type === "diag") && openDoorId === msg.door) refreshDoorDiag(msg.door);
 }
 
 async function updatePhoto(seq) {
@@ -143,6 +144,18 @@ function beep() {
     o.frequency.value = 880; o.connect(g); g.connect(ctx.destination); g.gain.value = 0.08;
     o.start(); setTimeout(() => { o.frequency.value = 660; }, 180); setTimeout(() => o.stop(), 420);
   } catch { /* audio blocked */ }
+}
+
+async function refreshDoorDiag(id) {
+  const d = await api(`/api/doors/${id}`);
+  const shots = $("#shots");
+  if (!shots) return;
+  const tmp = document.createElement("div");
+  tmp.innerHTML = diagSection(d);
+  const kvs = tmp.querySelector(".kvs, .empty");
+  const cur = shots.parentElement.querySelector(".section + .kvs, .section + .empty");
+  if (kvs && cur) cur.replaceWith(kvs);
+  shots.replaceWith(tmp.querySelector("#shots"));
 }
 
 // ---------- chrome ----------
@@ -423,7 +436,40 @@ PAGES.schedules = async (el) => {
 };
 
 // --- doors & devices
-const MODE_LABEL = { pin: "PIN only", card: "Card only", card_or_pin: "Card or PIN", card_and_pin: "Card + PIN" };
+const MODE_LABEL = { pin: "PIN only", card: "Card only", card_or_pin: "Card or PIN", card_and_pin: "Card + PIN",
+  face: "Face only (convenience)", face_and_pin: "Face + PIN" };
+
+const fmtBytes = (n) => n == null ? "—" : n > 1048576 ? `${(n / 1048576).toFixed(1)} MB` : `${Math.round(n / 1024)} KB`;
+const fmtUptime = (s) => { if (s == null) return "—"; const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60); return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : `${m}m ${s % 60}s`; };
+
+function diagSection(d) {
+  const g = d.diag;
+  const fresh = d.diag_ts && Date.now() / 1000 - d.diag_ts < 90;
+  const warn = (cond, text) => cond ? `<span style="color:var(--amber)">${text}</span>` : text;
+  const health = g ? `<div class="kvs">
+      ${kv("Firmware", esc(g.firmware))}${kv("Uptime", fmtUptime(g.uptime_s))}
+      ${kv("Last restart", warn(/crash|watchdog|brownout|glitch/.test(g.reset_reason), esc(g.reset_reason)))}
+      ${kv("Chip temperature", g.temp_c == null ? "—" : warn(g.temp_c > 75, `${g.temp_c} °C`))}
+      ${kv("Internal RAM free", warn(g.heap_internal < 40000, `${fmtBytes(g.heap_internal)} <span class="muted">(low ${fmtBytes(g.heap_internal_min)})</span>`))}
+      ${kv("PSRAM free", fmtBytes(g.heap_psram))}
+      ${kv("Camera", g.camera ? `<span style="color:var(--green)">Streaming</span>` : `<span style="color:var(--red)">Not running</span>`)}
+      ${kv("Card reader", g.reader ? `<span style="color:var(--green)">OK</span>` : "Not fitted")}
+      ${kv("Link errors", warn(g.link_errors > 0, g.link_errors))}${kv("Rejected frames", warn(g.rejected > 0, g.rejected))}
+      ${kv("Last decision", g.last_decision_ms ? `${g.last_decision_ms} ms` : "—")}
+      ${kv("Reported", d.diag_ts ? ago(d.diag_ts) : "—")}</div>`
+    : `<div class="empty" style="padding:16px">No health report yet. Panels report every 30 seconds once linked.</div>`;
+  const shot = (k, title) => d.media[k]
+    ? `<figure class="shot"><img src="/api/doors/${d.id}/media/${k}.jpg?${Date.now()}" data-cap="${title}"><figcaption>${title}</figcaption></figure>` : "";
+  return `<h3 class="section">Diagnostics ${fresh ? `<span class="pill green" style="margin-left:6px">live</span>` : ""}</h3>
+    ${health}
+    ${canOperate() ? `<div class="checks" style="margin-top:12px">
+      <button class="btn" data-cmd="identify">Identify</button>
+      <button class="btn" data-cmd="screenshot">Screenshot</button>
+      <button class="btn" data-cmd="test_photo">Test photo</button>
+      ${isAdmin() ? `<button class="btn danger" data-cmd="reboot">Reboot panel</button>` : ""}</div>
+      <p class="hint">Commands are sealed with the door key and delivered on the panel's next check-in (within 5 s).</p>` : ""}
+    <div class="shots" id="shots">${shot("screenshot", "Panel screen")}${shot("test_photo", "Camera test")}</div>`;
+}
 
 function kv(label, value, mono = false) {
   return `<div class="kv"><span>${label}</span><b class="${mono ? "mono" : ""}">${value ?? "—"}</b></div>`;
@@ -519,6 +565,8 @@ function adoptForm(dev, doors, groups) {
   });
 }
 
+let openDoorId = null;
+
 async function doorDetail(id, groups) {
   const d = await api(`/api/doors/${id}`);
   const ro = !isAdmin();
@@ -536,6 +584,8 @@ async function doorDetail(id, groups) {
     ${d.serial ? `<div class="kvs">${kv("Serial", esc(d.serial), true)}${kv("MAC", esc(d.mac), true)}${kv("Firmware", esc(d.firmware))}
       ${kv("Door controller", esc(d.controller))}${kv("Adopted", d.adopted_at ? fmtDate(d.adopted_at) : "—")}${kv("Last seen", ago(d.last_seen))}</div>`
       : `<div class="empty" style="padding:16px">No device adopted to this door. Adopt one from Unassigned devices.</div>`}
+
+    ${diagSection(d)}
 
     <h3 class="section">Settings</h3>
     <form class="form" id="dd">
@@ -555,6 +605,13 @@ async function doorDetail(id, groups) {
       <button class="btn danger" id="remove">Remove door</button></div>
       <p class="hint">Rotating the key re-delivers it to the panel automatically. Unassigning sends the panel back to "awaiting adoption" and voids its key.</p>`}`);
   if (ro) $$("#dd input, #dd select").forEach((i) => (i.disabled = true));
+  $$("[data-cmd]").forEach((b) => b.addEventListener("click", async () => {
+    const cmd = b.dataset.cmd;
+    if (cmd === "reboot" && !confirm(`Reboot the panel at ${d.name}? The door is unavailable for about 10 seconds.`)) return;
+    try { await api(`/api/doors/${id}/command`, { body: { command: cmd } }); toast(`${b.textContent} sent to ${d.name}`); }
+    catch (err) { toast(err.message, true); }
+  }));
+  openDoorId = id;
   $("#dd").addEventListener("submit", async (e) => {
     e.preventDefault();
     const f = new FormData(e.target);

@@ -15,8 +15,11 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from .access import AccessEngine
-from .protocol import (CredReq, Decision, FrameError, Header, Heartbeat, HeartbeatAck, MsgType, PinReq, PinResp,
-                       Reason, ReplayWindow, SiteMode, dir_for, Dir, open_frame, peek_header, seal)
+import json
+from dataclasses import asdict
+
+from .protocol import (CredReq, Decision, Diag, FrameError, Header, Heartbeat, HeartbeatAck, MsgType, PinReq,
+                       PinResp, Reason, ReplayWindow, SiteMode, dir_for, Dir, open_frame, peek_header, seal)
 from .store import Store
 
 log = logging.getLogger("lintel.controller")
@@ -65,6 +68,9 @@ class Controller:
     transport: asyncio.DatagramTransport | None = None
     # (door, ref) -> (cardholder or None, score, time, jpeg, error) from /api/door/{id}/face
     face_results: dict[tuple[int, int], tuple] = field(default_factory=dict)
+    # door -> (command, command_id), handed over once in the next heartbeat ack
+    commands: dict[int, tuple[int, int]] = field(default_factory=dict)
+    next_command_id: int = field(default_factory=lambda: int(time.time()) & 0x7FFFFFFF)
 
     # ---- door table -----------------------------------------------------------
 
@@ -131,11 +137,18 @@ class Controller:
                 self._on_pin(d, h, PinReq.decode(pt), addr, now)
             elif h.type == MsgType.CRED_REQ:
                 self._on_cred(d, h, CredReq.decode(pt), addr, now)
+            elif h.type == MsgType.DIAG:
+                diag = asdict(Diag.decode(pt))
+                self.store.x("UPDATE doors SET diag=?, diag_ts=? WHERE id=?", (json.dumps(diag), now, d.id))
+                self.publish({"type": "diag", "door": d.id})
             elif h.type == MsgType.HEARTBEAT:
                 hb = Heartbeat.decode(pt)
                 self.store.x("UPDATE doors SET rssi=? WHERE id=?", (hb.last_rssi, d.id))
+                cmd, cmd_id = self.commands.pop(d.id, (0, 0))
                 ack = HeartbeatAck(self.engine.site_mode(), 0, int(now), h.counter, self.engine.door_mode(d.id),
-                                   d.name)
+                                   d.name, cmd, cmd_id)
+                if cmd:
+                    log.info("door %d: command %d (#%d) delivered", d.id, cmd, cmd_id)
                 self._send(d, MsgType.HEARTBEAT_ACK, ack.encode(), addr)
         except FrameError as e:
             self._reject(d, now, f"malformed payload: {e}")
@@ -225,6 +238,11 @@ class Controller:
         self.store.x("UPDATE alarms SET state='cleared' WHERE door_id=? AND kind=? AND state!='cleared'",
                      (door_id, kind))
         self.publish({"type": "alarms"})
+
+    def queue_command(self, door_id: int, command: int) -> int:
+        self.next_command_id = (self.next_command_id + 1) & 0x7FFFFFFF or 1
+        self.commands[door_id] = (command, self.next_command_id)
+        return self.next_command_id
 
     def set_mode(self, mode: SiteMode, operator: str) -> dict[str, Any]:
         self.store.set_setting("site_mode", str(int(mode)))

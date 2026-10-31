@@ -7,6 +7,7 @@ import csv
 import hashlib
 import hmac
 import io
+import json
 import secrets
 import sqlite3
 import time
@@ -22,7 +23,7 @@ from pydantic import BaseModel, Field
 from . import adopt
 from .controller import Controller, photo_key
 from .photos import stamp_photo
-from .protocol import SiteMode
+from .protocol import COMMANDS, SiteMode
 from .store import Store, check_password, hash_password
 
 STATIC = Path(__file__).parent / "static"
@@ -130,6 +131,10 @@ class AdoptIn(BaseModel):
     area: str = ""
     unlock_ms: int = Field(5000, ge=1000, le=30000)
     groups: list[int] = []
+
+
+class CommandIn(BaseModel):
+    command: str = Field(pattern="^(reboot|identify|screenshot|test_photo)$")
 
 
 class AlarmAction(BaseModel):
@@ -607,6 +612,50 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int) -> FastAP
         hub.publish({"type": "event", "event": pj})
         return {"ok": True, "event": ev["seq"]}
 
+    @app.post("/api/doors/{door_id}/command")
+    def door_command(door_id: int, body: CommandIn, op: dict = Depends(operator)) -> dict:
+        if door_id not in ctl.doors:
+            raise HTTPException(404, "no such door")
+        if body.command == "reboot" and op["role"] != "admin":
+            raise HTTPException(403, "admin role required to reboot a panel")
+        cid = ctl.queue_command(door_id, COMMANDS[body.command])
+        journal(op, "door.command", f"{body.command.replace('_', ' ')} sent to door {door_id}", door_id=door_id)
+        return {"ok": True, "command_id": cid}
+
+    @app.post("/api/door/{door_id}/media")
+    async def upload_media(door_id: int, request: Request, kind: str) -> dict:
+        """Screenshots and test photos from a panel, signed like entry photos."""
+        if kind not in ("screenshot", "test_photo"):
+            raise HTTPException(400, "unknown media kind")
+        link = ctl.doors.get(door_id)
+        if link is None:
+            raise HTTPException(404, "unknown door")
+        body = await request.body()
+        if not 0 < len(body) <= 3_000_000:
+            raise HTTPException(413, "too large")
+        try:
+            ref = int(request.headers["x-lintel-req"])
+            mac = bytes.fromhex(request.headers["x-lintel-mac"])
+        except (KeyError, ValueError):
+            raise HTTPException(400, "missing signature")
+        want = hmac.new(photo_key(link.key), f"{kind}:{door_id}:{ref}:".encode() + hashlib.sha256(body).digest(),
+                        hashlib.sha256).digest()
+        if not hmac.compare_digest(mac, want):
+            raise HTTPException(403, "bad signature")
+        out = store.data_dir / "diag"
+        out.mkdir(exist_ok=True)
+        (out / f"door{door_id}_{kind}.jpg").write_bytes(body)
+        store.x("UPDATE doors SET diag_ts=diag_ts WHERE id=?", (door_id,))
+        hub.publish({"type": "media", "door": door_id, "kind": kind})
+        return {"ok": True}
+
+    @app.get("/api/doors/{door_id}/media/{kind}.jpg")
+    def get_media(door_id: int, kind: str, op: dict = Depends(viewer)):
+        f = store.data_dir / "diag" / f"door{door_id}_{kind}.jpg"
+        if kind not in ("screenshot", "test_photo") or not f.exists():
+            raise HTTPException(404, "none yet")
+        return FileResponse(f, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
     @app.get("/api/photos/{seq}.jpg")
     def photo(seq: int, op: dict = Depends(viewer)):
         r = store.q1("SELECT photo FROM events WHERE seq=?", (seq,))
@@ -743,6 +792,11 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int) -> FastAP
             "SELECT g.id, g.name, s.name schedule FROM access_group_doors gd JOIN access_groups g ON g.id = gd.group_id "
             "JOIN schedules s ON s.id = g.schedule_id WHERE gd.door_id=? ORDER BY g.name", (door_id,))]
         row["recent"] = event_query(15, None, door_id, None, None, None, None)
+        extra = store.q1("SELECT diag, diag_ts FROM doors WHERE id=?", (door_id,))
+        row["diag"] = json.loads(extra["diag"]) if extra and extra["diag"] else None
+        row["diag_ts"] = extra["diag_ts"] if extra else None
+        row["media"] = {k: (store.data_dir / "diag" / f"door{door_id}_{k}.jpg").exists()
+                        for k in ("screenshot", "test_photo")}
         midnight = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
         row["today"] = {r["kind"]: r["n"] for r in store.q(
             "SELECT kind, COUNT(*) n FROM events WHERE door_id=? AND ts>=? GROUP BY kind", (door_id, midnight))}

@@ -87,14 +87,42 @@ struct Heartbeat {
     uint8_t pending_events;
 };
 
+// Remote maintenance, delivered inside the sealed heartbeat reply so it is
+// authenticated with the door key and bound to a fresh request.
+enum class PanelCommand : uint8_t {
+    None = 0,
+    Reboot = 1,
+    Identify = 2,    // flash the screen so a technician can find this panel
+    Screenshot = 3,  // send a capture of the screen
+    TestPhoto = 4,   // send a camera frame
+};
+
 struct HeartbeatAck {
-    static constexpr size_t kLen = 1 + 2 + 4 + 4 + 1 + 24;
+    static constexpr size_t kLen = 1 + 2 + 4 + 4 + 1 + 24 + 1 + 4;
     SiteMode mode;
     uint16_t cache_version;  // latest offline cache the controller holds
     uint32_t time;           // controller wall clock, seconds
     uint32_t hb_counter;     // the Heartbeat frame counter this answers
     CredMode cred_mode;      // what this door accepts
     char door_name[24];      // as named on the server, zero padded
+    PanelCommand command;
+    uint32_t command_id;     // panel acts once per id
+};
+
+struct Diag {
+    static constexpr size_t kLen = 8 + 4 + 1 + 4 + 4 + 4 + 1 + 1 + 1 + 2 + 2 + 2;
+    char firmware[8];
+    uint32_t uptime_s;
+    uint8_t reset_reason;      // esp_reset_reason_t
+    uint32_t heap_internal;    // free bytes now
+    uint32_t heap_internal_min;
+    uint32_t heap_psram;
+    int8_t temp_c;             // chip temperature, -128 if unknown
+    uint8_t camera;            // 0 absent / failed, 1 streaming
+    uint8_t reader;            // 0 not fitted, 1 ok
+    uint16_t link_errors;      // controller-link CRC failures since boot
+    uint16_t rejected;         // frames dropped for bad auth or replay
+    uint16_t last_decision_ms;
 };
 
 enum class EventKind : uint8_t {
@@ -185,6 +213,7 @@ size_t encode(const CacheChunk& m, uint8_t* out);
 size_t encode(const PinReq& m, uint8_t* out);
 size_t encode(const PinResp& m, uint8_t* out);
 size_t encode(const CredReq& m, uint8_t* out);
+size_t encode(const Diag& m, uint8_t* out);
 
 bool decode(const uint8_t* p, size_t len, AccessReq& m);
 bool decode(const uint8_t* p, size_t len, AccessResp& m);
@@ -196,5 +225,6 @@ bool decode(const uint8_t* p, size_t len, CacheChunk& m);
 bool decode(const uint8_t* p, size_t len, PinReq& m);
 bool decode(const uint8_t* p, size_t len, PinResp& m);
 bool decode(const uint8_t* p, size_t len, CredReq& m);
+bool decode(const uint8_t* p, size_t len, Diag& m);
 
 }  // namespace lintel

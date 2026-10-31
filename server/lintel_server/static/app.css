@@ -177,3 +177,8 @@ tr.click:hover td { background: var(--panel-2); }
 .kv { background: var(--bg); border: 1px solid var(--line); border-radius: 9px; padding: 9px 12px; display: flex; flex-direction: column; gap: 3px; }
 .kv span { color: var(--faint); font-size: 11px; text-transform: uppercase; letter-spacing: 1px; } .kv b { font-weight: 500; word-break: break-all; }
 .drawer-panel { width: 560px; }
+
+.shots { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 14px; }
+.shot { margin: 0; background: var(--bg); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+.shot img { width: 100%; display: block; cursor: zoom-in; }
+.shot figcaption { color: var(--muted); font-size: 12px; padding: 7px 10px; }

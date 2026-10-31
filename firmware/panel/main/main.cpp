@@ -11,6 +11,8 @@
 #include <sys/time.h>
 
 #include "camera.h"
+#include "driver/temperature_sensor.h"
+#include "esp_heap_caps.h"
 #include "identity.h"
 #include "esp_console.h"
 #include "esp_log.h"
@@ -43,7 +45,8 @@ constexpr uint32_t kAckTimeoutMs = 1500;
 constexpr uint32_t kHeartbeatMs = 5000;
 constexpr int kMissedForOffline = 2;
 constexpr uint16_t kPhotoChunk = 1000;
-constexpr const char* kFirmware = "0.3.0";
+constexpr const char* kFirmware = "0.4.0";
+constexpr uint32_t kDiagMs = 30000;
 
 struct Config {
     uint16_t door_id;
@@ -52,6 +55,10 @@ struct Config {
 };
 
 Config s_cfg = {};
+uint32_t s_rejected = 0;
+uint32_t s_last_decision_ms = 0;
+uint32_t s_last_command_id = 0;
+temperature_sensor_handle_t s_tsens = nullptr;
 Identity s_id = {};
 bool s_provisioned = false;
 uint32_t s_adopt_seq = 0;
@@ -116,10 +123,12 @@ bool await_reply(MsgType type, uint32_t ctr, uint8_t* pt, size_t& len, uint32_t 
         if (!peek_header(d.data, d.len, h) || h.door_id != s_cfg.door_id) continue;
         if (!s_rx.accepts(h.counter)) {
             ESP_LOGW(TAG, "replayed frame dropped (ctr %lu)", static_cast<unsigned long>(h.counter));
+            ++s_rejected;
             continue;
         }
         if (!open_frame(s_cfg.key, s_cfg.net_id, d.data, d.len, h, pt, kMaxPayload, len)) {
             ESP_LOGW(TAG, "frame failed authentication, dropped");
+            ++s_rejected;
             continue;
         }
         s_rx.commit(h.counter);
@@ -233,6 +242,98 @@ void send_photo(uint32_t req_ctr) {
     free(jpg);
 }
 
+// ---- maintenance ------------------------------------------------------------------
+
+void send_media(uint8_t kind, const char* label, uint32_t ref, const uint8_t* jpg, size_t n) {
+    uint8_t pkey[kSha256Len], digest[kSha256Len], mac[kSha256Len];
+    static const char kPhotoLabel[] = "lintel-photo";
+    char prefix[48];
+    int plen = std::snprintf(prefix, sizeof(prefix), "%s:%u:%lu:", label, s_cfg.door_id, static_cast<unsigned long>(ref));
+    bool ok = hmac_sha256(s_cfg.key.b, kKeyLen, reinterpret_cast<const uint8_t*>(kPhotoLabel), sizeof(kPhotoLabel) - 1,
+                          nullptr, 0, pkey) &&
+              sha256(jpg, n, digest) &&
+              hmac_sha256(pkey, sizeof(pkey), reinterpret_cast<const uint8_t*>(prefix), static_cast<size_t>(plen),
+                          digest, sizeof(digest), mac);
+    secure_zero(pkey, sizeof(pkey));
+    if (!ok) return;
+    uint8_t start[9 + kSha256Len];
+    start[0] = kind;
+    put_u32(start + 1, ref);
+    put_u32(start + 5, static_cast<uint32_t>(n));
+    std::memcpy(start + 9, mac, sizeof(mac));
+    usb_link_send(kLinkMediaStart, start, sizeof(start));
+    for (size_t off = 0; off < n; off += kPhotoChunk) {
+        uint16_t c = static_cast<uint16_t>(n - off < kPhotoChunk ? n - off : kPhotoChunk);
+        usb_link_send(kLinkMediaChunk, jpg + off, c);
+    }
+    usb_link_send(kLinkMediaEnd, nullptr, 0);
+    ESP_LOGI(TAG, "%s sent (%u bytes)", label, static_cast<unsigned>(n));
+}
+
+void run_command(PanelCommand cmd, uint32_t id) {
+    if (cmd == PanelCommand::None || id == s_last_command_id) return;
+    s_last_command_id = id;
+    switch (cmd) {
+        case PanelCommand::Reboot:
+            ESP_LOGW(TAG, "reboot requested from the dashboard");
+            ui_show_message("Restarting", "Requested from the dashboard");
+            vTaskDelay(pdMS_TO_TICKS(1500));
+            esp_restart();
+            break;
+        case PanelCommand::Identify:
+            ui_identify(8000);
+            break;
+        case PanelCommand::Screenshot: {
+            uint32_t w = 0, h = 0;
+            size_t len = 0;
+            uint8_t* rgb = ui_snapshot(&w, &h, &len);
+            uint8_t* jpg = nullptr;
+            size_t n = 0;
+            if (rgb != nullptr && jpeg_encode_rgb565(rgb, w, h, len, &jpg, &n, 90)) {
+                send_media(1, "screenshot", id, jpg, n);
+                free(jpg);
+            } else {
+                ESP_LOGE(TAG, "screenshot failed");
+            }
+            free(rgb);
+            break;
+        }
+        case PanelCommand::TestPhoto: {
+            uint8_t* jpg = nullptr;
+            size_t n = 0;
+            if (camera_snapshot(&jpg, &n, 1500)) {
+                send_media(2, "test_photo", id, jpg, n);
+                free(jpg);
+            }
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+void send_diag() {
+    Diag d{};
+    std::snprintf(d.firmware, sizeof(d.firmware), "%s", kFirmware);
+    d.uptime_s = now_ms() / 1000;
+    d.reset_reason = static_cast<uint8_t>(esp_reset_reason());
+    d.heap_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    d.heap_internal_min = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
+    d.heap_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    float t = 0;
+    d.temp_c = (s_tsens != nullptr && temperature_sensor_get_celsius(s_tsens, &t) == ESP_OK)
+                   ? static_cast<int8_t>(t) : static_cast<int8_t>(-128);
+    d.camera = camera_running() ? 1 : 0;
+    d.reader = 0;
+    d.link_errors = static_cast<uint16_t>(usb_link_errors());
+    d.rejected = static_cast<uint16_t>(s_rejected);
+    d.last_decision_ms = static_cast<uint16_t>(s_last_decision_ms);
+    uint8_t pt[Diag::kLen];
+    encode(d, pt);
+    uint32_t ctr = 0;
+    send_frame(MsgType::Diag, pt, sizeof(pt), ctr);
+}
+
 // ---- PIN handling -----------------------------------------------------------------
 
 void on_submit(const char* pin, void*) {
@@ -262,6 +363,7 @@ void handle_pin(const PinMsg& m) {
         ui_show_denied("No answer", "Controller or server unreachable.\nDoor stays locked.");
         return;
     }
+    s_last_decision_ms = now_ms() - t0;
     ESP_LOGI(TAG, "decision %s (%s) in %lu ms", resp.decision == Decision::Grant ? "GRANT" : "DENY",
              reason_name(resp.reason), static_cast<unsigned long>(now_ms() - t0));
     if (resp.decision == Decision::Grant) {
@@ -282,7 +384,7 @@ void handle_pin(const PinMsg& m) {
     }
 }
 
-bool heartbeat(bool& lockdown, char* door_name, size_t name_cap) {
+bool heartbeat(bool& lockdown, char* door_name, size_t name_cap, HeartbeatAck& out) {
     Heartbeat hb{0, 0, 0, 0, now_ms() / 1000, 0};
     uint8_t pt[Heartbeat::kLen];
     encode(hb, pt);
@@ -297,6 +399,7 @@ bool heartbeat(bool& lockdown, char* door_name, size_t name_cap) {
     lockdown = ack.mode == SiteMode::Lockdown;
     if (ack.time > 1700000000u) set_clock(ack.time);  // the server is the clock
     std::snprintf(door_name, name_cap, "%s", ack.door_name);
+    out = ack;
     return true;
 }
 
@@ -304,6 +407,7 @@ void net_task(void*) {
     int missed = kMissedForOffline;
     uint32_t next_hb = now_ms();
     bool lockdown = false;
+    uint32_t next_diag = now_ms() + 3000;
     for (;;) {
         PinMsg m{};
         if (xQueueReceive(s_pin_q, &m, pdMS_TO_TICKS(100)) == pdTRUE) {
@@ -317,8 +421,17 @@ void net_task(void*) {
         bool wired = usb_link_host_connected();
         bool ld = lockdown;
         char name[24] = {};
-        bool alive = wired && heartbeat(ld, name, sizeof(name));
-        if (alive && name[0]) ui_set_door_name(name);
+        HeartbeatAck ack{};
+        bool alive = wired && heartbeat(ld, name, sizeof(name), ack);
+        if (alive) {
+            if (name[0]) ui_set_door_name(name);
+            ui_set_cred_mode(static_cast<uint8_t>(ack.cred_mode));
+            run_command(ack.command, ack.command_id);
+            if (static_cast<int32_t>(now_ms() - next_diag) >= 0) {
+                send_diag();
+                next_diag = now_ms() + kDiagMs;
+            }
+        }
         missed = alive ? 0 : missed + 1;
         if (alive && ld != lockdown) {
             lockdown = ld;
@@ -403,7 +516,7 @@ extern "C" void app_main(void) {
     lintel::kv_get_u32("adopt_seq", s_adopt_seq);
     if (!identity_load(s_id)) ESP_LOGE(TAG, "device identity unavailable");
 
-    ui_begin(CONFIG_PANEL_DOOR_NAME, on_submit, nullptr);
+    ui_begin("Lintel", on_submit, nullptr);  // renamed from the server on first heartbeat
     ui_set_link(false, false, 0);
     console_begin();
 
@@ -423,6 +536,12 @@ extern "C" void app_main(void) {
     uint32_t ceiling = 0;
     lintel::kv_get_u32("tx_ceil", ceiling);
     s_tx.resume(ceiling);
+    temperature_sensor_config_t tcfg = TEMPERATURE_SENSOR_CONFIG_DEFAULT(-10, 80);
+    if (temperature_sensor_install(&tcfg, &s_tsens) == ESP_OK) {
+        temperature_sensor_enable(s_tsens);
+    } else {
+        s_tsens = nullptr;
+    }
     camera_begin();
     xTaskCreate(net_task, "net", 8192, nullptr, 5, nullptr);
     ESP_LOGI(TAG, "door %u ready, waiting for controller on USB", s_cfg.door_id);

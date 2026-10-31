@@ -237,7 +237,9 @@ class Store:
     def _migrate(self) -> None:
         """Additive column changes for databases created by older versions."""
         for table, column, decl in (("doors", "credential_mode", "TEXT NOT NULL DEFAULT 'pin'"),
-                                    ("cardholders", "card_tag", "BLOB")):
+                                    ("cardholders", "card_tag", "BLOB"),
+                                    ("doors", "diag", "TEXT"),
+                                    ("doors", "diag_ts", "REAL")):
             cols = {r["name"] for r in self.q(f"PRAGMA table_info({table})")}
             if column not in cols:
                 self.x(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
