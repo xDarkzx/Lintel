@@ -79,15 +79,41 @@ async def serve(data: Path, host: str, http_port: int, udp_port: int) -> None:
     await asyncio.gather(server.serve(), run_controller(ctl, host, udp_port), maintenance(store, app))
 
 
+def restore(args) -> None:
+    import getpass
+
+    from .backup import BackupError, restore_backup
+    from .store import Store
+    passphrase = os.environ.get("LINTEL_BACKUP_PASSPHRASE") or getpass.getpass("Backup passphrase: ")
+    try:
+        files = restore_backup(Path(args.file).read_bytes(), passphrase, Path(args.data), force=args.force)
+    except BackupError as e:
+        raise SystemExit(f"restore failed: {e}")
+    store = Store(Path(args.data))
+    check = store.verify_journal()
+    print(f"restored {len(files)} files into {args.data}")
+    print(f"audit chain: {'intact' if check['ok'] else 'BROKEN at #' + str(check['broken_at'])}, "
+          f"{check['checked']} records")
+    if not check["ok"]:
+        raise SystemExit(2)
+
+
 def main() -> None:
     p = argparse.ArgumentParser(prog="lintel_server")
-    p.add_argument("command", nargs="?", default="serve", choices=["serve"])
+    p.add_argument("command", nargs="?", default="serve", choices=["serve", "restore"])
+    p.add_argument("file", nargs="?", help="restore: the .lbk backup file")
+    p.add_argument("--force", action="store_true", help="restore: replace an existing database")
     p.add_argument("--data", default=os.environ.get("LINTEL_DATA", "data"))
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--http-port", type=int, default=int(os.environ.get("LINTEL_HTTPS_PORT", "8443")))
     p.add_argument("--udp-port", type=int, default=int(os.environ.get("LINTEL_UDP_PORT", "47800")))
     a = p.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    if a.command == "restore":
+        if not a.file:
+            raise SystemExit("usage: python -m lintel_server restore <backup.lbk> [--data DIR] [--force]")
+        restore(a)
+        return
     asyncio.run(serve(Path(a.data), a.host, a.http_port, a.udp_port))
 
 

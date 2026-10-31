@@ -134,6 +134,12 @@ CREATE TABLE IF NOT EXISTS devices (
     pending_door INTEGER
 );
 
+CREATE TABLE IF NOT EXISTS holidays (
+    id INTEGER PRIMARY KEY,
+    day TEXT NOT NULL UNIQUE,   -- YYYY-MM-DD, site local
+    name TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS face_templates (
     id INTEGER PRIMARY KEY,
     cardholder_id INTEGER NOT NULL REFERENCES cardholders(id) ON DELETE CASCADE,
@@ -218,6 +224,9 @@ class Store:
         self._lock = threading.RLock()
         self._migrate()
         self._seed()
+        # Round-the-clock schedules ignore holidays; everything else closes on them.
+        self.x("UPDATE schedules SET observe_holidays = CASE WHEN name='24/7' THEN 0 ELSE 1 END "
+               "WHERE observe_holidays IS NULL")
 
     # ---- low level ---------------------------------------------------------
 
@@ -233,6 +242,10 @@ class Store:
         with self._lock:
             cur = self._db.execute(sql, args)
             return cur.lastrowid or cur.rowcount
+
+    def backup_to(self, dst: sqlite3.Connection) -> None:
+        with self._lock:
+            self._db.backup(dst)
 
     def setting(self, key: str, default: str = "") -> str:
         r = self.q1("SELECT value FROM settings WHERE key=?", (key,))
@@ -252,12 +265,16 @@ class Store:
                                     ("operators", "totp_secret", "TEXT"),
                                     ("operators", "totp_last_step", "INTEGER NOT NULL DEFAULT 0"),
                                     ("operators", "last_login", "REAL"),
-                                    ("sessions", "last_seen", "REAL")):
+                                    ("sessions", "last_seen", "REAL"),
+                                    ("schedules", "observe_holidays", "INTEGER")):
             cols = {r["name"] for r in self.q(f"PRAGMA table_info({table})")}
             if column not in cols:
                 self.x(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
         self.x("CREATE UNIQUE INDEX IF NOT EXISTS cardholders_card ON cardholders(card_tag)")
         self.x("UPDATE doors SET key_created=? WHERE key_created IS NULL", (time.time(),))
+        # Round-the-clock schedules ignore holidays; everything else closes on them.
+        self.x("UPDATE schedules SET observe_holidays = CASE WHEN name='24/7' THEN 0 ELSE 1 END "
+               "WHERE observe_holidays IS NULL")
         for k, v in (("photo_retention_days", "90"), ("rekey_days", "30"), ("require_admin_mfa", "0")):
             if not self.setting(k):
                 self.set_setting(k, v)

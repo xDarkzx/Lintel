@@ -91,6 +91,10 @@ class AccessEngine:
         self.enrol[door_id] = (cardholder_id, (time.time() if now is None else now) + ENROL_TTL_S)
 
     def _schedule_allows(self, schedule_id: int, when: datetime) -> bool:
+        s = self.store.q1("SELECT observe_holidays FROM schedules WHERE id=?", (schedule_id,))
+        if s and s["observe_holidays"] and self.store.q1("SELECT 1 FROM holidays WHERE day=?",
+                                                          (when.strftime("%Y-%m-%d"),)):
+            return False
         minute = when.hour * 60 + when.minute
         for w in self.store.q("SELECT days, start_min, end_min FROM schedule_windows WHERE schedule_id=?",
                               (schedule_id,)):

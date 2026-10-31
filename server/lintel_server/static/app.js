@@ -604,12 +604,27 @@ function weekGrid(windows) {
     ${DAYS.map((d, i) => `<span>${d}</span>${Array.from({ length: 24 }, (_, h) => `<span class="cell ${on(i, h) ? "on" : ""}"></span>`).join("")}`).join("")}</div>`;
 }
 PAGES.schedules = async (el) => {
-  const schedules = await api("/api/schedules");
+  const [schedules, holidays] = await Promise.all([api("/api/schedules"), api("/api/holidays")]);
+  const upcoming = holidays.filter((h) => h.day >= new Date().toISOString().slice(0, 10));
   el.innerHTML = head("Schedules", "When access groups are allowed through, in site local time",
     isAdmin() ? `<button id="add" class="btn primary">${icon("plus")}New schedule</button>` : "")
     + `<div class="grid" style="grid-template-columns:repeat(auto-fill,minmax(420px,1fr))">${schedules.map((s) => `<div class="card sched" data-id="${s.id}" style="cursor:pointer">
-      <div class="card-head"><h2>${esc(s.name)}</h2><span class="muted">${s.windows.length} window${s.windows.length === 1 ? "" : "s"}</span></div>
-      <div class="card-body">${weekGrid(s.windows)}</div></div>`).join("")}</div>`;
+      <div class="card-head"><h2>${esc(s.name)}</h2><span class="muted">${s.windows.length} window${s.windows.length === 1 ? "" : "s"} · ${s.observe_holidays ? "closed on holidays" : "ignores holidays"}</span></div>
+      <div class="card-body">${weekGrid(s.windows)}</div></div>`).join("")}</div>
+    <div class="card" style="margin-top:16px"><div class="card-head"><h2>Holidays</h2><span class="muted">${upcoming.length} upcoming</span></div>
+      ${isAdmin() ? `<form id="hol" class="card-body row3" style="align-items:end;border-bottom:1px solid var(--line)">
+        <label class="field"><span>Date</span><input name="day" type="date" required></label>
+        <label class="field"><span>Name</span><input name="name" required placeholder="e.g. Waitangi Day"></label>
+        <div class="field"><span>&nbsp;</span><button class="btn primary">${icon("plus")}Add holiday</button></div></form>` : ""}
+      <div class="table-wrap"><table><thead><tr><th>Date</th><th>Holiday</th><th></th></tr></thead><tbody>
+      ${holidays.map((h) => `<tr><td>${new Date(h.day + "T00:00").toLocaleDateString([], { weekday: "short", day: "numeric", month: "short", year: "numeric" })}</td><td>${esc(h.name)}</td>
+        <td style="text-align:right">${isAdmin() ? `<button class="btn sm ghost" data-hol="${h.id}">${icon("trash", "sm")}</button>` : ""}</td></tr>`).join("")
+        || `<tr><td colspan="3" class="muted">No holidays. Schedules that observe holidays stay closed on these dates.</td></tr>`}</tbody></table></div></div>`;
+  $("#hol")?.addEventListener("submit", async (e) => {
+    e.preventDefault(); const f = new FormData(e.target);
+    try { await api("/api/holidays", { body: { day: f.get("day"), name: f.get("name") } }); render(); } catch (err) { fail(err); }
+  });
+  $$("[data-hol]").forEach((b) => b.addEventListener("click", async () => { await api(`/api/holidays/${b.dataset.hol}`, { method: "DELETE" }); render(); }));
   const winRow = (w) => `<div class="card win" style="padding:12px;display:flex;flex-direction:column;gap:10px">
     <div class="checks">${DAYS.map((d, i) => `<label class="chk"><input type="checkbox" value="${i}" ${w.days & (1 << i) ? "checked" : ""}>${d}</label>`).join("")}</div>
     <div class="row3"><label class="field"><span>From</span><input type="time" class="ws" value="${hhmm(w.start_min)}"></label>
@@ -619,6 +634,7 @@ PAGES.schedules = async (el) => {
     if (!isAdmin()) return;
     openPanel(panelShell({ title: s ? esc(s.name) : "New schedule", sub: "00:00 to 00:00 means all day; an end before the start runs past midnight" }));
     $("#panel-content").innerHTML = `<form id="sf" class="stack"><label class="field"><span>Name</span><input name="name" required value="${esc(s?.name)}"></label>
+      <label class="chk" style="align-self:flex-start"><input type="checkbox" name="observe_holidays" ${!s || s.observe_holidays ? "checked" : ""}>Closed on holidays</label>
       <div id="wins" class="stack">${(s?.windows || [{ days: 31, start_min: 480, end_min: 1020 }]).map(winRow).join("")}</div>
       <button type="button" id="addw" class="btn">${icon("plus")}Add time window</button>
       <div class="actions" style="justify-content:space-between">${s ? `<button type="button" id="del" class="btn danger">${icon("trash")}Delete</button>` : "<span></span>"}<button class="btn primary">Save</button></div></form>`;
@@ -632,7 +648,8 @@ PAGES.schedules = async (el) => {
         const a = parseHHMM($(".ws", w).value), b = parseHHMM($(".we", w).value);
         return { days, start_min: a, end_min: a === 0 && b === 0 ? 1440 : b };
       });
-      try { await api(s ? `/api/schedules/${s.id}` : "/api/schedules", { method: s ? "PUT" : "POST", body: { name: new FormData(e.target).get("name"), windows } }); closePanel(); render(); }
+      const fd = new FormData(e.target);
+      try { await api(s ? `/api/schedules/${s.id}` : "/api/schedules", { method: s ? "PUT" : "POST", body: { name: fd.get("name"), windows, observe_holidays: fd.has("observe_holidays") } }); closePanel(); render(); }
       catch (err) { fail(err); }
     });
     $("#del")?.addEventListener("click", async () => { try { await api(`/api/schedules/${s.id}`, { method: "DELETE" }); closePanel(); render(); } catch (err) { fail(err); } });
@@ -871,12 +888,36 @@ PAGES.settings = async (el) => {
           ${kv("Door controller token", `<span class="mono">${esc(s.controller_token_hint)}</span>`)}</div>
         <p class="muted" style="margin:0;font-size:12.5px">Door controllers pin this certificate and present the controller token on every call. Both are written to <span class="mono">controller.env</span> in the server's data folder for installing on a controller.</p>
       </div></div>
+      ${isAdmin() ? `<div class="card"><div class="card-head"><h2>Backup</h2><span class="muted">${s.last_backup ? `Last backup ${ago(s.last_backup)}` : `<span style="color:var(--warn)">Never backed up</span>`}</span></div>
+        <div class="card-body"><form id="bk" class="stack">
+        <p class="muted" style="margin:0;font-size:12.5px">Downloads the database, keys and certificate, encrypted with a passphrase you choose now. The server never keeps the passphrase: without it the file cannot be restored. Store the file off this machine.</p>
+        <div class="row2"><label class="field"><span>Passphrase</span><input name="p1" type="password" minlength="16" required autocomplete="new-password"><small>At least 16 characters</small></label>
+          <label class="field"><span>Repeat passphrase</span><input name="p2" type="password" minlength="16" required autocomplete="new-password"></label></div>
+        <label class="field"><span>Your password</span><input name="password" type="password" required autocomplete="current-password"></label>
+        <label class="chk" style="align-self:flex-start"><input type="checkbox" name="photos">Include entry photos</label>
+        <div class="actions" style="justify-content:flex-end"><button class="btn primary">${icon("download")}Download encrypted backup</button></div>
+        <p class="muted" style="margin:0;font-size:12px">Restore on a new server: <span class="mono">python -m lintel_server restore backup.lbk --data data</span></p></form></div></div>` : ""}
       ${isAdmin() ? `<div class="card"><div class="card-head"><h2>Alarm notifications</h2></div><div class="card-body"><form id="wh" class="stack">
         <label class="field"><span>Webhook URL (HTTPS)</span><input name="url" placeholder="https://… (Teams, Slack, pager gateway)"><small>Alarms are posted as JSON with a plain-text summary in <span class="mono">text</span>.</small></label>
         <label class="field"><span>Send alarms of priority</span><select name="min_priority"><option value="1">P1 only (critical)</option><option value="2">P1 and P2</option><option value="3">P1 to P3</option><option value="4">All</option></select></label>
         <div class="actions" style="justify-content:flex-end"><button type="button" id="wh-test" class="btn">Send test</button><button class="btn primary">Save</button></div></form></div></div>` : ""}
       </div>`;
   if (ro) $$("#sf input").forEach((i) => (i.disabled = true));
+  $("#bk")?.addEventListener("submit", async (e) => {
+    e.preventDefault(); const f = new FormData(e.target);
+    if (f.get("p1") !== f.get("p2")) return toast("The passphrases do not match", "bad");
+    try {
+      const res = await fetch("/api/backup", { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ passphrase: f.get("p1"), password: f.get("password"), include_photos: f.has("photos") }) });
+      if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
+      const blob = await res.blob();
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = (res.headers.get("content-disposition") || "").match(/filename="([^"]+)"/)?.[1] || "lintel-backup.lbk";
+      a.click(); URL.revokeObjectURL(a.href);
+      e.target.reset(); toast("Encrypted backup downloaded");
+    } catch (err) { fail(err); }
+  });
   if (isAdmin()) {
     const w = await api("/api/settings/webhook");
     $("#wh [name=url]").value = w.url; $("#wh [name=min_priority]").value = String(w.min_priority);

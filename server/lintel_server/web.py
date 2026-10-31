@@ -135,6 +135,12 @@ class WindowIn(BaseModel):
 class ScheduleIn(BaseModel):
     name: str = Field(min_length=1)
     windows: list[WindowIn]
+    observe_holidays: bool = True
+
+
+class HolidayIn(BaseModel):
+    day: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    name: str = Field(min_length=1, max_length=60)
 
 
 class GroupIn(BaseModel):
@@ -165,6 +171,12 @@ class AdoptIn(BaseModel):
 class CommandIn(BaseModel):
     command: str = Field(pattern="^(reboot|identify|screenshot|test_photo|unlock)$")
     reason: str = Field("", max_length=200)
+
+
+class BackupIn(BaseModel):
+    passphrase: str = Field(min_length=16, max_length=200)
+    password: str
+    include_photos: bool = False
 
 
 class AlarmAction(BaseModel):
@@ -372,12 +384,36 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
             raise HTTPException(502, f"webhook failed: {detail}")
         return {"ok": True}
 
+    @app.post("/api/backup")
+    def download_backup(body: BackupIn, op: dict = Depends(admin)):
+        """Encrypted with a passphrase the admin chooses now and the server never keeps.
+        Re-checks the admin's password: a walked-away session cannot export the site."""
+        from .backup import BackupError, create_backup
+        if not check_password(body.password, op["pw_hash"]):
+            raise HTTPException(403, "password is wrong")
+
+        class _Proxy:  # sqlite backup through the store's lock
+            def backup(self, dst):
+                store.backup_to(dst)
+
+        try:
+            blob = create_backup(store.data_dir, _Proxy(), body.passphrase, body.include_photos)
+        except BackupError as e:
+            raise HTTPException(400, str(e))
+        store.set_setting("last_backup", str(time.time()))
+        journal(op, "system.backup", f"encrypted backup downloaded ({len(blob) // 1024} KB"
+                + (", with photos)" if body.include_photos else ")"))
+        name = f"lintel-backup-{datetime.now():%Y%m%d-%H%M}.lbk"
+        return Response(blob, media_type="application/octet-stream",
+                        headers={"Content-Disposition": f'attachment; filename="{name}"', "Cache-Control": "no-store"})
+
     @app.get("/api/settings")
     def get_settings(op: dict = Depends(viewer)) -> dict:
         return {"site_name": store.setting("site_name"),
                 "photo_retention_days": int(store.setting("photo_retention_days", "90")),
                 "rekey_days": int(store.setting("rekey_days", "30")),
                 "require_admin_mfa": store.setting("require_admin_mfa") == "1",
+                "last_backup": float(store.setting("last_backup") or 0) or None,
                 "controller_token_hint": store.secrets.controller_token[:6] + "...",
                 "tls_fingerprint": getattr(app.state, "tls_fingerprint", None)}
 
@@ -537,7 +573,8 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
     @app.post("/api/schedules")
     def add_schedule(body: ScheduleIn, op: dict = Depends(admin)) -> dict:
         try:
-            sid = store.x("INSERT INTO schedules(name) VALUES(?)", (body.name,))
+            sid = store.x("INSERT INTO schedules(name, observe_holidays) VALUES(?, ?)",
+                          (body.name, int(body.observe_holidays)))
         except sqlite3.IntegrityError:
             raise HTTPException(409, "schedule name already used")
         write_windows(sid, body.windows)
@@ -546,7 +583,8 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
 
     @app.put("/api/schedules/{sid}")
     def put_schedule(sid: int, body: ScheduleIn, op: dict = Depends(admin)) -> dict:
-        store.x("UPDATE schedules SET name=? WHERE id=?", (body.name, sid))
+        store.x("UPDATE schedules SET name=?, observe_holidays=? WHERE id=?",
+                (body.name, int(body.observe_holidays), sid))
         write_windows(sid, body.windows)
         journal(op, "schedule.updated", f"schedule '{body.name}' updated")
         return {"ok": True}
@@ -558,6 +596,31 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
         except sqlite3.IntegrityError:
             raise HTTPException(409, "schedule is used by an access group")
         journal(op, "schedule.deleted", f"schedule {sid} deleted")
+        return {"ok": True}
+
+    @app.get("/api/holidays")
+    def holidays(op: dict = Depends(viewer)) -> list[dict]:
+        return [dict(r) for r in store.q("SELECT * FROM holidays ORDER BY day")]
+
+    @app.post("/api/holidays")
+    def add_holiday(body: HolidayIn, op: dict = Depends(admin)) -> dict:
+        try:
+            datetime.strptime(body.day, "%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(422, "not a real date")
+        try:
+            hid = store.x("INSERT INTO holidays(day, name) VALUES(?, ?)", (body.day, body.name))
+        except sqlite3.IntegrityError:
+            raise HTTPException(409, "that date is already a holiday")
+        journal(op, "schedule.holiday_added", f"{body.day} {body.name}")
+        return {"id": hid}
+
+    @app.delete("/api/holidays/{hid}")
+    def del_holiday(hid: int, op: dict = Depends(admin)) -> dict:
+        r = store.q1("SELECT * FROM holidays WHERE id=?", (hid,))
+        store.x("DELETE FROM holidays WHERE id=?", (hid,))
+        if r:
+            journal(op, "schedule.holiday_removed", f"{r['day']} {r['name']}")
         return {"ok": True}
 
     @app.get("/api/groups")
