@@ -9,3 +9,4 @@ __pycache__/
 secrets/
 *.keys.json
 build-*.log
+*.log
