@@ -2,7 +2,7 @@
 #   .\scripts\idf.ps1 door build
 #   .\scripts\idf.ps1 door -p COM5 flash monitor
 param(
-    [Parameter(Mandatory = $true)][ValidateSet("door", "relay", "console")][string]$Project,
+    [Parameter(Mandatory = $true)][ValidateSet("door", "panel")][string]$Project,
     [Parameter(ValueFromRemainingArguments = $true)][string[]]$IdfArgs
 )
 $ErrorActionPreference = "Continue"

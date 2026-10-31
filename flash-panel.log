@@ -1,0 +1,140 @@
+﻿python : Activating ESP-IDF 5.4
+At C:\esp\esp-idf\export.ps1:24 char:16
++ $idf_exports = python "$idf_path/tools/activate.py" --export
++                ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (Activating ESP-IDF 5.4:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+Setting IDF_PATH to 'C:\esp\esp-idf'.
+* Checking python version ... 3.11.9
+* Checking python dependencies ... OK
+* Deactivating the current ESP-IDF environment (if any) ... OK
+* Establishing a new ESP-IDF environment ... OK
+* Identifying shell ... powershell.exe
+* Detecting outdated tools in system ... OK - no outdated tools found
+Executing action: flash
+Running ninja in directory D:\DansProject\Lintel\firmware\panel\build
+Executing "ninja flash"...
+[1/5] C:\WINDOWS\system32\cmd.exe /C "cd /D D:\DansProject\Lintel\firmware\panel\build\esp-idf\esptool_py && C:\Users\GGPC\.espressif\python_env\idf5.4_py3.11_env\Scripts\python.exe C:/esp/esp-idf/components/partition_table/check_sizes.py --offset 0x8000 partition --type app D:/DansProject/Lintel/firmware/panel/build/partition_table/partition-table.bin D:/DansProject/Lintel/firmware/panel/build/lintel_panel.bin"
+
+lintel_panel.bin binary size 0x9cc00 bytes. Smallest app partition is 0x100000 bytes. 0x63400 bytes (39%) free.
+
+
+[2/5] Performing build step for 'bootloader'
+
+[1/1] C:\WINDOWS\system32\cmd.exe /C "cd /D D:\DansProject\Lintel\firmware\panel\build\bootloader\esp-idf\esptool_py && C:\Users\GGPC\.espressif\python_env\idf5.4_py3.11_env\Scripts\python.exe C:/esp/esp-idf/components/partition_table/check_sizes.py --offset 0x8000 bootloader 0x2000 D:/DansProject/Lintel/firmware/panel/build/bootloader/bootloader.bin"
+
+
+Bootloader binary size 0x5660 bytes. 0x9a0 bytes (10%) free.
+
+
+
+[3/5] No install step for 'bootloader'
+
+[4/5] Completed 'bootloader'
+
+[4/5] C:\WINDOWS\system32\cmd.exe /C "cd /D C:\esp\esp-idf\components\esptool_py && C:\Users\GGPC\.espressif\tools\cmake\3.30.2\bin\cmake.exe -D IDF_PATH=C:/esp/esp-idf -D SERIAL_TOOL=C:/Users/GGPC/.espressif/python_env/idf5.4_py3.11_env/Scripts/python.exe;;C:/esp/esp-idf/components/esptool_py/esptool/esptool.py;--chip;esp32p4 -D SERIAL_TOOL_ARGS=--before=default_reset;--after=hard_reset;write_flash;@flash_args -D WORKING_DIRECTORY=D:/DansProject/Lintel/firmware/panel/build -P C:/esp/esp-idf/components/esptool_py/run_serial_tool.cmake"
+
+esptool.py --chip esp32p4 -p COM4 -b 460800 --before=default_reset --after=hard_reset write_flash --flash_mode dio --flash_freq 80m --flash_size 16MB 0x2000 bootloader/bootloader.bin 0x10000 lintel_panel.bin 0x8000 partition_table/partition-table.bin
+
+esptool.py v4.12.0
+
+Serial port COM4
+
+Connecting....
+
+Chip is ESP32-P4 (revision v1.3)
+
+Features: High-Performance MCU
+
+Crystal is 40MHz
+
+USB mode: USB-Serial/JTAG
+
+MAC: 80:f1:b2:d3:61:1f
+
+Uploading stub...
+
+Running stub...
+
+Stub running...
+
+Changing baud rate to 460800
+
+Changed.
+
+Configuring flash size...
+
+Flash will be erased from 0x00002000 to 0x00007fff...
+
+Flash will be erased from 0x00010000 to 0x000acfff...
+
+Flash will be erased from 0x00008000 to 0x00008fff...
+
+SHA digest in image updated
+
+Compressed 22112 bytes to 13591...
+
+Writing at 0x00002000... (100 %)
+
+Wrote 22112 bytes (13591 compressed) at 0x00002000 in 0.2 seconds (effective 794.6 kbit/s)...
+
+Hash of data verified.
+
+Compressed 642048 bytes to 289505...
+
+Writing at 0x00010000... (5 %)
+
+Writing at 0x0001f30c... (11 %)
+
+Writing at 0x0002bb3a... (16 %)
+
+Writing at 0x0003d3e1... (22 %)
+
+Writing at 0x00045124... (27 %)
+
+Writing at 0x0004c3c6... (33 %)
+
+Writing at 0x000536e2... (38 %)
+
+Writing at 0x0005b454... (44 %)
+
+Writing at 0x00066594... (50 %)
+
+Writing at 0x0006eb82... (55 %)
+
+Writing at 0x000766c4... (61 %)
+
+Writing at 0x0007d0cb... (66 %)
+
+Writing at 0x0008446e... (72 %)
+
+Writing at 0x0008b582... (77 %)
+
+Writing at 0x000922f2... (83 %)
+
+Writing at 0x000994c6... (88 %)
+
+Writing at 0x0009fdf9... (94 %)
+
+Writing at 0x000a70e5... (100 %)
+
+Wrote 642048 bytes (289505 compressed) at 0x00010000 in 3.3 seconds (effective 1557.6 kbit/s)...
+
+Hash of data verified.
+
+Compressed 3072 bytes to 103...
+
+Writing at 0x00008000... (100 %)
+
+Wrote 3072 bytes (103 compressed) at 0x00008000 in 0.0 seconds (effective 758.3 kbit/s)...
+
+Hash of data verified.
+
+
+
+Leaving...
+
+Hard resetting via RTS pin...
+
+Done
