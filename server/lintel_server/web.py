@@ -24,10 +24,12 @@ from . import adopt
 from .controller import Controller, photo_key
 from .photos import stamp_photo
 from .protocol import COMMANDS, SiteMode
+from .security import (SECURITY_HEADERS, LoginThrottle, totp_new_secret, totp_uri, totp_verify)
 from .store import Store, check_password, hash_password
 
 STATIC = Path(__file__).parent / "static"
 SESSION_S = 12 * 3600
+IDLE_S = 30 * 60
 ROLES = {"viewer": 0, "operator": 1, "admin": 2}
 
 
@@ -50,6 +52,23 @@ class Hub:
 class Login(BaseModel):
     username: str
     password: str
+    code: str = ""
+
+
+class CodeIn(BaseModel):
+    code: str = Field(pattern=r"^\d{6}$")
+
+
+class SettingsIn(BaseModel):
+    site_name: str | None = Field(None, min_length=1, max_length=60)
+    photo_retention_days: int | None = Field(None, ge=1, le=3650)
+    rekey_days: int | None = Field(None, ge=1, le=365)
+    require_admin_mfa: bool | None = None
+
+
+class PasswordIn(BaseModel):
+    current: str
+    new: str = Field(min_length=12)
 
 
 class DoorIn(BaseModel):
@@ -158,6 +177,24 @@ class CardEnrolIn(BaseModel):
 def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: Any = None) -> FastAPI:
     app = FastAPI(title="Lintel Access Control", docs_url="/api/docs", openapi_url="/api/openapi.json")
     app.mount("/static", StaticFiles(directory=STATIC), name="static")
+    throttle = LoginThrottle()
+
+    @app.middleware("http")
+    async def security_headers(request: Request, call_next):
+        response = await call_next(request)
+        for k, v in SECURITY_HEADERS.items():
+            if k == "Content-Security-Policy" and request.url.path.startswith("/api/docs"):
+                continue  # Swagger UI loads its own assets
+            response.headers.setdefault(k, v)
+        if request.url.scheme == "https":
+            response.headers.setdefault("Strict-Transport-Security", "max-age=31536000")
+        return response
+
+    def controller_auth(request: Request) -> None:
+        """Door controllers present the site's controller token."""
+        got = request.headers.get("authorization", "").removeprefix("Bearer ").strip()
+        if not got or not hmac.compare_digest(got, store.secrets.controller_token):
+            raise HTTPException(401, "controller token required")
 
     # ---- auth ------------------------------------------------------------------
 
@@ -165,9 +202,16 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
         if not token:
             return None
         th = hashlib.sha256(token.encode()).hexdigest()
-        r = store.q1("SELECT o.* FROM sessions s JOIN operators o ON o.id = s.operator_id "
-                     "WHERE s.token_hash=? AND s.expires>? AND o.active=1", (th, time.time()))
-        return dict(r) if r else None
+        now = time.time()
+        r = store.q1("SELECT o.*, s.last_seen FROM sessions s JOIN operators o ON o.id = s.operator_id "
+                     "WHERE s.token_hash=? AND s.expires>? AND o.active=1", (th, now))
+        if r is None:
+            return None
+        if r["last_seen"] and now - r["last_seen"] > IDLE_S:
+            store.x("DELETE FROM sessions WHERE token_hash=?", (th,))
+            return None
+        store.x("UPDATE sessions SET last_seen=? WHERE token_hash=?", (now, th))
+        return dict(r)
 
     def need(role: str):
         def dep(request: Request) -> dict:
@@ -186,17 +230,104 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
         hub.publish({"type": "event", "event": ev})
 
     @app.post("/api/login")
-    def login(body: Login, response: Response) -> dict:
+    def login(body: Login, request: Request, response: Response) -> dict:
+        ip = request.client.host if request.client else "?"
+        keys = (f"user:{body.username.lower()}", f"ip:{ip}")
+        wait = throttle.blocked(*keys)
+        if wait:
+            raise HTTPException(429, f"too many failed sign-ins; try again in {wait // 60 + 1} min")
         r = store.q1("SELECT * FROM operators WHERE username=? AND active=1", (body.username,))
-        if r is None or not check_password(body.password, r["pw_hash"]):
-            store.journal("operator.login_failed", operator=body.username, detail="bad credentials")
-            raise HTTPException(401, "invalid username or password")
+        ok = r is not None and check_password(body.password, r["pw_hash"])
+        if ok and r["totp_secret"]:
+            if not body.code:
+                return {"mfa_required": True}
+            step = totp_verify(r["totp_secret"], body.code)
+            ok = step is not None and step > r["totp_last_step"]  # each code works once
+            if ok:
+                store.x("UPDATE operators SET totp_last_step=? WHERE id=?", (step, r["id"]))
+        if not ok:
+            store.journal("operator.login_failed", operator=body.username, detail=f"bad credentials from {ip}")
+            if throttle.fail(*keys):
+                ev = store.journal("operator.login_locked", operator=body.username,
+                                   detail=f"sign-in locked after repeated failures from {ip}")
+                al = store.raise_alarm(2, "operator.bruteforce", f"Repeated failed sign-ins for '{body.username}'",
+                                       event_seq=ev["seq"])
+                hub.publish({"type": "alarm", "alarm": al})
+            raise HTTPException(401, "invalid username, password or code")
+        throttle.succeed(*keys)
         token = secrets.token_urlsafe(32)
-        store.x("INSERT INTO sessions(token_hash, operator_id, expires) VALUES(?, ?, ?)",
-                (hashlib.sha256(token.encode()).hexdigest(), r["id"], time.time() + SESSION_S))
-        response.set_cookie("lintel_session", token, httponly=True, samesite="strict", max_age=SESSION_S)
-        journal(dict(r), "operator.login", "signed in")
-        return {"username": r["username"], "role": r["role"]}
+        now = time.time()
+        store.x("INSERT INTO sessions(token_hash, operator_id, expires, last_seen) VALUES(?, ?, ?, ?)",
+                (hashlib.sha256(token.encode()).hexdigest(), r["id"], now + SESSION_S, now))
+        store.x("UPDATE operators SET last_login=? WHERE id=?", (now, r["id"]))
+        response.set_cookie("lintel_session", token, httponly=True, samesite="strict", max_age=SESSION_S,
+                            secure=request.url.scheme == "https")
+        journal(dict(r), "operator.login", f"signed in from {ip}" + (" with 2FA" if r["totp_secret"] else ""))
+        nudge = r["role"] == "admin" and not r["totp_secret"] and store.setting("require_admin_mfa") == "1"
+        return {"username": r["username"], "role": r["role"], "mfa_setup_required": nudge}
+
+    @app.post("/api/me/mfa/setup")
+    def mfa_setup(op: dict = Depends(viewer)) -> dict:
+        if op["totp_secret"]:
+            raise HTTPException(409, "two-factor sign-in is already on")
+        secret = totp_new_secret()
+        store.set_setting(f"pending_totp:{op['id']}", secret)
+        uri = totp_uri(secret, op["username"])
+        svg = ""
+        try:
+            import qrcode
+            import qrcode.image.svg
+            img = qrcode.make(uri, image_factory=qrcode.image.svg.SvgPathImage, box_size=8, border=2)
+            svg = img.to_string(encoding="unicode")
+        except ImportError:
+            pass
+        return {"secret": secret, "uri": uri, "qr_svg": svg}
+
+    @app.post("/api/me/mfa/confirm")
+    def mfa_confirm(body: CodeIn, op: dict = Depends(viewer)) -> dict:
+        secret = store.setting(f"pending_totp:{op['id']}")
+        step = totp_verify(secret, body.code) if secret else None
+        if step is None:
+            raise HTTPException(400, "that code does not match; check the time on your phone")
+        store.x("UPDATE operators SET totp_secret=?, totp_last_step=? WHERE id=?", (secret, step, op["id"]))
+        store.x("DELETE FROM settings WHERE key=?", (f"pending_totp:{op['id']}",))
+        journal(op, "operator.mfa_enabled", "two-factor sign-in turned on")
+        return {"ok": True}
+
+    @app.post("/api/me/mfa/disable")
+    def mfa_disable(body: CodeIn, op: dict = Depends(viewer)) -> dict:
+        if not op["totp_secret"] or totp_verify(op["totp_secret"], body.code) is None:
+            raise HTTPException(400, "a current code is required to turn two-factor off")
+        store.x("UPDATE operators SET totp_secret=NULL WHERE id=?", (op["id"],))
+        journal(op, "operator.mfa_disabled", "two-factor sign-in turned off")
+        return {"ok": True}
+
+    @app.post("/api/me/password")
+    def change_password(body: PasswordIn, op: dict = Depends(viewer)) -> dict:
+        if not check_password(body.current, op["pw_hash"]):
+            raise HTTPException(400, "current password is wrong")
+        store.x("UPDATE operators SET pw_hash=? WHERE id=?", (hash_password(body.new), op["id"]))
+        store.x("DELETE FROM sessions WHERE operator_id=?", (op["id"],))
+        journal(op, "operator.password_changed", "password changed; other sessions signed out")
+        return {"ok": True}
+
+    @app.get("/api/settings")
+    def get_settings(op: dict = Depends(viewer)) -> dict:
+        return {"site_name": store.setting("site_name"),
+                "photo_retention_days": int(store.setting("photo_retention_days", "90")),
+                "rekey_days": int(store.setting("rekey_days", "30")),
+                "require_admin_mfa": store.setting("require_admin_mfa") == "1",
+                "controller_token_hint": store.secrets.controller_token[:6] + "...",
+                "tls_fingerprint": getattr(app.state, "tls_fingerprint", None)}
+
+    @app.patch("/api/settings")
+    def put_settings(body: SettingsIn, op: dict = Depends(admin)) -> dict:
+        changed = []
+        for k, v in body.model_dump(exclude_none=True).items():
+            store.set_setting(k, ("1" if v else "0") if isinstance(v, bool) else str(v))
+            changed.append(k)
+        journal(op, "settings.updated", f"changed: {', '.join(changed)}")
+        return {"ok": True}
 
     @app.post("/api/logout")
     def logout(request: Request, response: Response) -> dict:
@@ -208,7 +339,8 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
 
     @app.get("/api/me")
     def me(op: dict = Depends(viewer)) -> dict:
-        return {"username": op["username"], "role": op["role"], "site_name": store.setting("site_name")}
+        return {"username": op["username"], "role": op["role"], "site_name": store.setting("site_name"),
+                "mfa": bool(op["totp_secret"]), "require_admin_mfa": store.setting("require_admin_mfa") == "1"}
 
     # ---- overview ----------------------------------------------------------------
 
@@ -254,8 +386,8 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
     def add_door(body: DoorIn, op: dict = Depends(admin)) -> dict:
         key = secrets.token_bytes(16)
         try:
-            store.x("INSERT INTO doors(id, name, area, key, unlock_ms) VALUES(?, ?, ?, ?, ?)",
-                    (body.id, body.name, body.area, key, body.unlock_ms))
+            store.x("INSERT INTO doors(id, name, area, key, unlock_ms, key_created) VALUES(?, ?, ?, ?, ?, ?)",
+                    (body.id, body.name, body.area, key, body.unlock_ms, time.time()))
         except sqlite3.IntegrityError:
             raise HTTPException(409, f"door {body.id} already exists")
         ctl.load_door(body.id)
@@ -267,7 +399,8 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
     @app.post("/api/doors/{door_id}/rekey")
     def rekey(door_id: int, op: dict = Depends(admin)) -> dict:
         key = secrets.token_bytes(16)
-        if store.x("UPDATE doors SET key=?, tx_ceiling=0, rx_highest=0 WHERE id=?", (key, door_id)) == 0:
+        if store.x("UPDATE doors SET key=?, tx_ceiling=0, rx_highest=0, key_created=? WHERE id=?",
+                   (key, time.time(), door_id)) == 0:
             raise HTTPException(404, "no such door")
         ctl.load_door(door_id)
         dev = store.q1("SELECT * FROM devices WHERE door_id=?", (door_id,))
@@ -277,6 +410,21 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
             queue_blob(dev, door_id, key)
             return {"id": door_id, "auto": True}
         return {"id": door_id, "net_id": f"{store.secrets.net_id:08x}", "key": key.hex(), "udp_port": udp_port}
+
+    def auto_rekey(door_id: int) -> None:
+        dev = store.q1("SELECT * FROM devices WHERE door_id=?", (door_id,))
+        if dev is None:
+            return
+        key = secrets.token_bytes(16)
+        store.x("UPDATE doors SET key=?, tx_ceiling=0, rx_highest=0, key_created=? WHERE id=?",
+                (key, time.time(), door_id))
+        ctl.load_door(door_id)
+        queue_blob(dev, door_id, key)
+        ev = store.journal("door.rekeyed", door_id=door_id, operator="system",
+                           detail=f"scheduled key rotation sent to {dev['serial']}")
+        hub.publish({"type": "event", "event": ev})
+
+    app.state.auto_rekey = auto_rekey
 
     @app.patch("/api/doors/{door_id}")
     def patch_door(door_id: int, body: DoorPatch, op: dict = Depends(admin)) -> dict:
@@ -556,7 +704,7 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
         journal(op, "cardholder.card_removed", "card removed", cardholder_id=cid)
         return {"ok": True}
 
-    @app.post("/api/door/{door_id}/face")
+    @app.post("/api/door/{door_id}/face", dependencies=[Depends(controller_auth)])
     async def door_face(door_id: int, request: Request) -> dict:
         """A panel's face scan, relayed by its controller and signed like photos.
         The result is held for the CredReq that follows; the controller learns
@@ -661,7 +809,8 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
 
     @app.get("/api/operators")
     def operators(op: dict = Depends(admin)) -> list[dict]:
-        return [dict(r) for r in store.q("SELECT id, username, role, active, created FROM operators ORDER BY username")]
+        return [dict(r) for r in store.q("SELECT id, username, role, active, created, last_login, "
+                                         "totp_secret IS NOT NULL mfa FROM operators ORDER BY username")]
 
     @app.post("/api/operators")
     def add_operator(body: OperatorIn, op: dict = Depends(admin)) -> dict:
@@ -683,7 +832,7 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
 
     # ---- photos ------------------------------------------------------------------------------------
 
-    @app.post("/api/door/{door_id}/photo")
+    @app.post("/api/door/{door_id}/photo", dependencies=[Depends(controller_auth)])
     async def upload_photo(door_id: int, request: Request) -> dict:
         """Called by a panel right after a grant. Signed with a key derived from
         the door key, and bound to the request counter of that grant."""
@@ -732,7 +881,7 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
         journal(op, "door.command", f"{body.command.replace('_', ' ')} sent to door {door_id}", door_id=door_id)
         return {"ok": True, "command_id": cid}
 
-    @app.post("/api/door/{door_id}/media")
+    @app.post("/api/door/{door_id}/media", dependencies=[Depends(controller_auth)])
     async def upload_media(door_id: int, request: Request, kind: str) -> dict:
         """Screenshots and test photos from a panel, signed like entry photos."""
         if kind not in ("screenshot", "test_photo"):
@@ -790,7 +939,7 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
         d["online"] = time.time() - d["last_seen"] < 20
         return d
 
-    @app.post("/api/devices/announce")
+    @app.post("/api/devices/announce", dependencies=[Depends(controller_auth)])
     def announce(body: Announce, request: Request) -> dict:
         """Called by door controllers for every panel they can see. No operator
         login: announcing only lists a device; adopting it needs an admin and

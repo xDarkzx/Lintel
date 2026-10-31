@@ -17,6 +17,6 @@ COPY lintel_server ./lintel_server
 RUN useradd -r -u 1000 lintel && mkdir -p /data && chown lintel /data
 USER lintel
 VOLUME /data
-EXPOSE 8080/tcp 47800/udp
-HEALTHCHECK --interval=30s --timeout=3s CMD python -c "import urllib.request,sys; urllib.request.urlopen(\"http://127.0.0.1:8080/api/openapi.json\")" || exit 1
+EXPOSE 8443/tcp 47800/udp
+HEALTHCHECK --interval=30s --timeout=3s CMD python -c "import urllib.request,sys; urllib.request.urlopen(\"https://127.0.0.1:8443/api/openapi.json\", context=__import__('ssl')._create_unverified_context())" || exit 1
 CMD ["python", "-m", "lintel_server", "serve"]

@@ -58,6 +58,8 @@ def env(tmp_path):
     ctl = Controller(store, AccessEngine(store), hub.publish)
     ctl.transport = FakeTransport()
     client = TestClient(create_app(store, ctl, hub, 47800))
+    # The test client also plays the door controller, which presents the site token.
+    client.headers["Authorization"] = f"Bearer {store.secrets.controller_token}"
     pw = (tmp_path / "initial_admin.txt").read_text().split("password: ")[1].strip()
     assert client.post("/api/login", json={"username": "admin", "password": pw}).status_code == 200
     door = client.post("/api/doors", json={"id": 1, "name": "Main Entrance"}).json()
@@ -229,3 +231,44 @@ def test_roles_and_pin_rules(env):
     assert v.get("/api/events").status_code == 200
     assert v.post("/api/mode", json={"mode": 1}).status_code == 403
     assert TestClient(client.app).get("/api/events").status_code == 401
+
+
+def test_controller_endpoints_need_the_token(env):
+    store, ctl, client, panel, gid = env
+    anon = TestClient(client.app)
+    r = anon.post("/api/devices/announce", json={"serial": "LNT-000000000001", "pubkey": "00" * 32})
+    assert r.status_code == 401
+    r = anon.post("/api/door/1/photo", content=b"x", headers={"Authorization": "Bearer wrong"})
+    assert r.status_code == 401
+
+
+def test_security_headers_present(env):
+    store, ctl, client, panel, gid = env
+    h = client.get("/").headers
+    assert "frame-ancestors 'none'" in h["content-security-policy"]
+    assert h["x-frame-options"] == "DENY" and h["x-content-type-options"] == "nosniff"
+
+
+def test_operator_two_factor_and_login_lockout(env):
+    from lintel_server.security import totp_now
+    store, ctl, client, panel, gid = env
+    setup = client.post("/api/me/mfa/setup").json()
+    assert setup["qr_svg"].startswith("<?xml") or setup["qr_svg"].startswith("<svg")
+    assert client.post("/api/me/mfa/confirm", json={"code": "000000" if totp_now(setup["secret"]) != "000000"
+                                                    else "111111"}).status_code == 400
+    assert client.post("/api/me/mfa/confirm", json={"code": totp_now(setup["secret"])}).status_code == 200
+
+    pw = (store.data_dir / "initial_admin.txt").read_text().split("password: ")[1].strip()
+    fresh = TestClient(client.app)
+    assert fresh.post("/api/login", json={"username": "admin", "password": pw}).json() == {"mfa_required": True}
+    code = totp_now(setup["secret"])
+    # The code used to confirm is spent; the same 30 s step cannot be replayed.
+    assert fresh.post("/api/login", json={"username": "admin", "password": pw, "code": code}).status_code == 401
+
+    attacker = TestClient(client.app)
+    # The replayed code above already counts as one failure for this name and address.
+    for _ in range(3):
+        assert attacker.post("/api/login", json={"username": "admin", "password": "guess"}).status_code == 401
+    assert attacker.post("/api/login", json={"username": "admin", "password": "guess"}).status_code == 401
+    assert attacker.post("/api/login", json={"username": "admin", "password": pw}).status_code == 429
+    assert any(a["kind"] == "operator.bruteforce" for a in client.get("/api/alarms").json())

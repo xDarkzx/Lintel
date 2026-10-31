@@ -14,14 +14,17 @@ taking it over gives an attacker nothing they could not already sniff.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import hmac
+import http.client
 import json
+import os
+import ssl
 import logging
 import socket
 import struct
 import threading
 import time
-import urllib.error
-import urllib.request
 from pathlib import Path
 
 import serial
@@ -112,10 +115,13 @@ def find_panel_port() -> str | None:
 
 
 class DoorController:
-    def __init__(self, port: str | None, server: str, udp_port: int, http_port: int) -> None:
+    def __init__(self, port: str | None, server: str, udp_port: int, http_port: int, token: str, pin: str) -> None:
         self.port_name = port
         self.server = (server, udp_port)
-        self.http = f"http://{server}:{http_port}"
+        self.http_host, self.http_port = server, http_port
+        self.http = f"https://{server}:{http_port}"
+        self.token = token
+        self.pin = pin.lower().replace(":", "")
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.settimeout(0.5)
         self.ser: serial.Serial | None = None
@@ -176,6 +182,24 @@ class DoorController:
             else:
                 log.warning("photo truncated (%d of %d bytes), dropped", len(ph["data"]), ph["size"])
 
+    def post(self, path: str, data: bytes, headers: dict[str, str]) -> tuple[int, bytes]:
+        """HTTPS POST to the server, accepting only the certificate we pinned.
+        Our own self-signed server has no CA, so the pin is the trust anchor."""
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE  # replaced by the explicit pin check below
+        conn = http.client.HTTPSConnection(self.http_host, self.http_port, timeout=10, context=ctx)
+        try:
+            conn.connect()
+            der = conn.sock.getpeercert(binary_form=True)
+            if not der or not hmac.compare_digest(hashlib.sha256(der).hexdigest(), self.pin):
+                raise ssl.SSLError("server certificate does not match the pinned fingerprint")
+            conn.request("POST", path, body=data, headers={**headers, "Authorization": f"Bearer {self.token}"})
+            r = conn.getresponse()
+            return r.status, r.read()
+        finally:
+            conn.close()
+
     def announce(self, p: bytes) -> None:
         """Pass the panel's identity to the server; hand back a sealed
         adoption message if the server has one waiting for it."""
@@ -183,17 +207,16 @@ class DoorController:
         body = {"serial": fields.get("serial", ""), "pubkey": p[:32].hex(), "mac": fields.get("mac", ""),
                 "firmware": fields.get("fw", ""), "controller": self.name,
                 "door": int(fields.get("door", "0")), "seq": int(fields.get("seq", "0"))}
-        req = urllib.request.Request(f"{self.http}/api/devices/announce", data=json.dumps(body).encode(),
-                                     method="POST", headers={"Content-Type": "application/json"})
         try:
-            with urllib.request.urlopen(req, timeout=5) as r:
-                reply = json.loads(r.read())
-        except urllib.error.HTTPError as e:
-            log.error("server refused announce from %s: %s %s", body["serial"], e.code, e.read().decode(errors="replace"))
-            return
-        except OSError as e:
+            status, raw = self.post("/api/devices/announce", json.dumps(body).encode(),
+                                    {"Content-Type": "application/json"})
+        except (OSError, ssl.SSLError) as e:
             log.warning("announce failed: %s", e)
             return
+        if status != 200:
+            log.error("server refused announce from %s: %s %s", body["serial"], status, raw.decode(errors="replace"))
+            return
+        reply = json.loads(raw)
         state = reply.get("state")
         if reply.get("provision"):
             log.info("delivering sealed door assignment to %s", body["serial"])
@@ -207,30 +230,31 @@ class DoorController:
         self.local_media.mkdir(exist_ok=True)
         local = self.local_media / f"door{self.door_id}_{m['kind']}.jpg"
         local.write_bytes(bytes(m["data"]))
-        req = urllib.request.Request(f"{self.http}/api/door/{self.door_id}/media?kind={m['kind']}",
-                                     data=bytes(m["data"]), method="POST",
-                                     headers={"Content-Type": "image/jpeg", "X-Lintel-Req": str(m["req"]),
-                                              "X-Lintel-Mac": m["mac"]})
         try:
-            with urllib.request.urlopen(req, timeout=10):
+            status, raw = self.post(f"/api/door/{self.door_id}/media?kind={m['kind']}", bytes(m["data"]),
+                                    {"Content-Type": "image/jpeg", "X-Lintel-Req": str(m["req"]),
+                                     "X-Lintel-Mac": m["mac"]})
+            if status == 200:
                 log.info("%s from door %s stored (%d bytes, local copy %s)", m["kind"], self.door_id, m["size"], local)
-        except (urllib.error.HTTPError, OSError) as e:
+            else:
+                log.error("%s refused: %s %s", m["kind"], status, raw.decode(errors="replace"))
+        except (OSError, ssl.SSLError) as e:
             log.error("%s upload failed: %s", m["kind"], e)
 
     def upload_photo(self, ph: dict) -> None:
         if self.door_id is None:
             log.warning("photo before HELLO, door id unknown; dropped")
             return
-        req = urllib.request.Request(f"{self.http}/api/door/{self.door_id}/photo", data=bytes(ph["data"]),
-                                     method="POST", headers={"Content-Type": "image/jpeg",
-                                                             "X-Lintel-Req": str(ph["req"]), "X-Lintel-Mac": ph["mac"]})
         try:
-            with urllib.request.urlopen(req, timeout=10) as r:
-                log.info("entry photo stored (%d bytes): %s", ph["size"], r.read().decode())
+            status, raw = self.post(f"/api/door/{self.door_id}/photo", bytes(ph["data"]),
+                                    {"Content-Type": "image/jpeg", "X-Lintel-Req": str(ph["req"]),
+                                     "X-Lintel-Mac": ph["mac"]})
+            if status == 200:
+                log.info("entry photo stored (%d bytes): %s", ph["size"], raw.decode())
                 self.stats["photos"] += 1
-        except urllib.error.HTTPError as e:
-            log.error("server refused photo: %s %s", e.code, e.read().decode(errors="replace"))
-        except OSError as e:
+            else:
+                log.error("server refused photo: %s %s", status, raw.decode(errors="replace"))
+        except (OSError, ssl.SSLError) as e:
             log.error("photo upload failed: %s", e)
 
     # ---- loops ---------------------------------------------------------------------
@@ -293,10 +317,17 @@ def main() -> None:
     p.add_argument("--port", help="keypad serial port (default: auto-detect the TinyUSB CDC device)")
     p.add_argument("--server", default="127.0.0.1", help="Lintel server address")
     p.add_argument("--udp-port", type=int, default=47800)
-    p.add_argument("--http-port", type=int, default=8088)
+    p.add_argument("--https-port", type=int, default=8443)
+    p.add_argument("--env", help="controller.env written by the server (token and certificate pin)")
     a = p.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    DoorController(a.port, a.server, a.udp_port, a.http_port).run()
+    env = dict(os.environ)
+    if a.env:
+        env.update(dict(line.split("=", 1) for line in Path(a.env).read_text().split() if "=" in line))
+    token, pin = env.get("LINTEL_TOKEN"), env.get("LINTEL_PIN_SHA256")
+    if not token or not pin:
+        raise SystemExit("need LINTEL_TOKEN and LINTEL_PIN_SHA256 (pass --env path/to/controller.env)")
+    DoorController(a.port, a.server, a.udp_port, a.https_port, token, pin).run()
 
 
 if __name__ == "__main__":

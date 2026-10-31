@@ -1,67 +1,91 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="light">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Lintel Command</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/static/app.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%231d4ed8'/%3E%3Cpath d='M9 24V11h14v13' stroke='white' stroke-width='3' fill='none'/%3E%3C/svg%3E">
 </head>
 <body>
-<div id="login" class="login hidden">
-  <form id="login-form" class="login-card">
-    <div class="brand big"><span class="brand-mark"></span>LINTEL</div>
-    <p class="muted">Access control command centre</p>
-    <label>Username<input name="username" autocomplete="username" required></label>
-    <label>Password<input name="password" type="password" autocomplete="current-password" required></label>
-    <button class="btn primary wide">Sign in</button>
-    <p id="login-error" class="error"></p>
-  </form>
+
+<div id="login" class="auth hidden">
+  <div class="auth-card">
+    <div class="wordmark"><span class="mark"></span>Lintel</div>
+    <h1>Sign in to Command</h1>
+    <p class="sub">Access control for your site</p>
+    <form id="login-form" class="stack">
+      <label class="field"><span>Username</span><input name="username" autocomplete="username" required></label>
+      <label class="field"><span>Password</span><input name="password" type="password" autocomplete="current-password" required></label>
+      <label class="field hidden" id="code-field"><span>Authenticator code</span>
+        <input name="code" inputmode="numeric" autocomplete="one-time-code" pattern="\d{6}" maxlength="6" placeholder="6-digit code"></label>
+      <button class="btn primary block" type="submit">Sign in</button>
+      <p id="login-error" class="form-error"></p>
+    </form>
+  </div>
+  <p class="auth-foot">Connection encrypted · every sign-in is recorded</p>
 </div>
 
 <div id="app" class="shell hidden">
-  <aside class="nav">
-    <div class="brand"><span class="brand-mark"></span>LINTEL</div>
-    <div id="site-name" class="site-name"></div>
-    <nav id="nav">
-      <a href="#monitor" data-page="monitor"><i>&#9673;</i>Monitor</a>
-      <a href="#alarms" data-page="alarms"><i>&#9888;</i>Alarms<span id="nav-alarms" class="count hidden"></span></a>
-      <a href="#events" data-page="events"><i>&#8801;</i>Events &amp; reports</a>
-      <div class="nav-section">Configuration</div>
-      <a href="#cardholders" data-page="cardholders"><i>&#9786;</i>Cardholders</a>
-      <a href="#groups" data-page="groups"><i>&#9638;</i>Access groups</a>
-      <a href="#schedules" data-page="schedules"><i>&#9719;</i>Schedules</a>
-      <a href="#doors" data-page="doors"><i>&#9707;</i>Doors</a>
-      <div class="nav-section">System</div>
-      <a href="#operators" data-page="operators" data-role="admin"><i>&#9881;</i>Operators</a>
-      <a href="#audit" data-page="audit"><i>&#10003;</i>Audit integrity</a>
+  <aside class="side">
+    <div class="side-brand"><span class="mark"></span><span>Lintel</span><span class="tag">Command</span></div>
+    <div class="site-card"><div class="site-ico"><svg class="ic"><use href="/static/icons.svg#i-building"/></svg></div>
+      <div><div id="site-name" class="site-name">—</div><div class="site-sub">Site · <span id="site-doors">0 doors</span></div></div></div>
+    <nav id="nav" class="nav">
+      <div class="nav-group">Operations</div>
+      <a href="#monitor" data-page="monitor"><svg class="ic"><use href="/static/icons.svg#i-layout-dashboard"/></svg>Monitor</a>
+      <a href="#alarms" data-page="alarms"><svg class="ic"><use href="/static/icons.svg#i-bell"/></svg>Alarms<span id="nav-alarms" class="nav-count hidden"></span></a>
+      <a href="#activity" data-page="activity"><svg class="ic"><use href="/static/icons.svg#i-list-details"/></svg>Activity</a>
+      <div class="nav-group">People &amp; access</div>
+      <a href="#cardholders" data-page="cardholders"><svg class="ic"><use href="/static/icons.svg#i-users"/></svg>Cardholders</a>
+      <a href="#groups" data-page="groups"><svg class="ic"><use href="/static/icons.svg#i-users-group"/></svg>Access groups</a>
+      <a href="#schedules" data-page="schedules"><svg class="ic"><use href="/static/icons.svg#i-calendar-time"/></svg>Schedules</a>
+      <div class="nav-group">Hardware</div>
+      <a href="#doors" data-page="doors"><svg class="ic"><use href="/static/icons.svg#i-door"/></svg>Doors &amp; devices<span id="nav-devices" class="nav-count info hidden"></span></a>
+      <div class="nav-group">Administration</div>
+      <a href="#operators" data-page="operators" data-admin><svg class="ic"><use href="/static/icons.svg#i-user-shield"/></svg>Operators</a>
+      <a href="#settings" data-page="settings"><svg class="ic"><use href="/static/icons.svg#i-settings"/></svg>Settings</a>
+      <a href="#audit" data-page="audit"><svg class="ic"><use href="/static/icons.svg#i-shield-check"/></svg>Audit trail</a>
     </nav>
-    <div class="nav-foot"><span id="ws-dot" class="dot amber"></span><span id="ws-text">connecting</span></div>
+    <div class="side-foot"><span id="sys-dot" class="dot"></span><span id="sys-text">Connecting…</span></div>
   </aside>
 
-  <main class="main">
-    <header class="topbar">
-      <h1 id="page-title">Monitor</h1>
-      <div class="topbar-right">
-        <div class="mode-switch" id="mode-switch">
-          <button data-mode="0">Normal</button>
-          <button data-mode="1">Lockdown</button>
-          <button data-mode="2">Free access</button>
+  <div class="main">
+    <header class="top">
+      <div class="search">
+        <svg class="ic"><use href="/static/icons.svg#i-search"/></svg>
+        <input id="search" placeholder="Search people, doors…" autocomplete="off">
+        <kbd>/</kbd>
+        <div id="search-results" class="search-results hidden"></div>
+      </div>
+      <div class="top-right">
+        <button id="mode-btn" class="mode-btn" title="Site mode"><span class="dot"></span><span id="mode-text">Normal</span>
+          <svg class="ic sm"><use href="/static/icons.svg#i-chevron-down"/></svg></button>
+        <div id="mode-menu" class="menu hidden">
+          <button data-mode="0"><span class="dot ok"></span><div><b>Normal</b><small>Schedules and access groups apply</small></div></button>
+          <button data-mode="1"><span class="dot bad"></span><div><b>Lockdown</b><small>Only override cardholders can enter</small></div></button>
+          <button data-mode="2"><span class="dot warn"></span><div><b>Free access</b><small>Evacuation: doors released</small></div></button>
         </div>
-        <div class="user"><span id="user-name"></span><span id="user-role" class="role"></span>
-          <button id="logout" class="btn ghost small">Sign out</button></div>
+        <a href="#alarms" class="icon-btn" title="Alarms"><svg class="ic"><use href="/static/icons.svg#i-bell"/></svg><span id="bell-count" class="bell-count hidden"></span></a>
+        <button id="theme" class="icon-btn" title="Theme"><svg class="ic"><use href="/static/icons.svg#i-moon"/></svg></button>
+        <button id="user-btn" class="user-btn"><span id="avatar" class="avatar">?</span><span id="user-name"></span>
+          <svg class="ic sm"><use href="/static/icons.svg#i-chevron-down"/></svg></button>
+        <div id="user-menu" class="menu right hidden">
+          <div class="menu-head"><b id="menu-user"></b><small id="menu-role"></small></div>
+          <button data-act="security"><svg class="ic"><use href="/static/icons.svg#i-shield-lock"/></svg>Account security</button>
+          <button data-act="logout"><svg class="ic"><use href="/static/icons.svg#i-logout"/></svg>Sign out</button>
+        </div>
       </div>
     </header>
-    <div id="lockdown-strip" class="strip hidden">&#9888; SITE LOCKDOWN ACTIVE &mdash; only override cardholders can enter</div>
-    <div id="free-strip" class="strip amber hidden">&#9888; FREE ACCESS &mdash; doors released, schedules suspended</div>
+    <div id="banner" class="banner hidden"></div>
     <section id="page" class="page"></section>
-  </main>
+  </div>
 </div>
 
-<div id="drawer" class="drawer hidden"><div class="drawer-panel"><div id="drawer-body"></div></div></div>
-<div id="lightbox" class="lightbox hidden"><img alt="Entry photo"><div class="lightbox-cap"></div></div>
-<div id="toast" class="toast hidden"></div>
+<div id="panel" class="panel-wrap hidden"><aside class="panel"><div id="panel-body"></div></aside></div>
+<div id="modal" class="modal-wrap hidden"><div class="modal" id="modal-body"></div></div>
+<div id="lightbox" class="lightbox hidden"><figure><img alt="Photo"><figcaption></figcaption></figure></div>
+<div id="toasts" class="toasts"></div>
 <script src="/static/app.js"></script>
 </body>
 </html>

@@ -181,16 +181,24 @@ class Secrets:
     net_id: int
     pepper: bytes      # keys PIN tags; never stored in the database
     audit_key: bytes   # keys the event chain
+    controller_token: str = ""  # door controllers present this on every HTTP call
 
     @staticmethod
     def load_or_create(path: Path) -> "Secrets":
         if path.exists():
             d = json.loads(path.read_text())
-            return Secrets(int(d["net_id"], 16), bytes.fromhex(d["pepper"]), bytes.fromhex(d["audit_key"]))
-        s = Secrets(secrets.randbits(32), secrets.token_bytes(32), secrets.token_bytes(32))
+            s = Secrets(int(d["net_id"], 16), bytes.fromhex(d["pepper"]), bytes.fromhex(d["audit_key"]),
+                        d.get("controller_token", ""))
+            if s.controller_token:
+                return s
+            s.controller_token = secrets.token_urlsafe(32)  # upgrade an older secrets file
+        else:
+            s = Secrets(secrets.randbits(32), secrets.token_bytes(32), secrets.token_bytes(32),
+                        secrets.token_urlsafe(32))
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({"net_id": f"{s.net_id:08x}", "pepper": s.pepper.hex(),
-                                    "audit_key": s.audit_key.hex()}, indent=2))
+                                    "audit_key": s.audit_key.hex(), "controller_token": s.controller_token},
+                                   indent=2))
         try:
             os.chmod(path, 0o600)
         except OSError:
@@ -239,11 +247,20 @@ class Store:
         for table, column, decl in (("doors", "credential_mode", "TEXT NOT NULL DEFAULT 'pin'"),
                                     ("cardholders", "card_tag", "BLOB"),
                                     ("doors", "diag", "TEXT"),
-                                    ("doors", "diag_ts", "REAL")):
+                                    ("doors", "diag_ts", "REAL"),
+                                    ("doors", "key_created", "REAL"),
+                                    ("operators", "totp_secret", "TEXT"),
+                                    ("operators", "totp_last_step", "INTEGER NOT NULL DEFAULT 0"),
+                                    ("operators", "last_login", "REAL"),
+                                    ("sessions", "last_seen", "REAL")):
             cols = {r["name"] for r in self.q(f"PRAGMA table_info({table})")}
             if column not in cols:
                 self.x(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
         self.x("CREATE UNIQUE INDEX IF NOT EXISTS cardholders_card ON cardholders(card_tag)")
+        self.x("UPDATE doors SET key_created=? WHERE key_created IS NULL", (time.time(),))
+        for k, v in (("photo_retention_days", "90"), ("rekey_days", "30"), ("require_admin_mfa", "0")):
+            if not self.setting(k):
+                self.set_setting(k, v)
 
     # ---- first run ----------------------------------------------------------
 
