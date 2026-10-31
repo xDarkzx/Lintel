@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "lintel/frame.h"
+#include "lintel/messages.h"
 #include "test_util.h"
 
 using namespace lintel;
@@ -101,4 +102,26 @@ TEST(Frame, MalformedHeadersRejected) {
     f[0] = 0x1F;                                        // type 15
     EXPECT_FALSE(peek_header(f, kHeaderLen + kTagLen, h));
     EXPECT_FALSE(peek_header(nullptr, 20, h));
+}
+
+// Golden vectors shared with the Python server (server/tests/test_protocol.py).
+// If either side changes the wire format, both tests fail.
+TEST(Frame, GoldenVectorsMatchServer) {
+    Key k = testutil::key_fill(0x11);
+    PinReq req{};
+    req.pin_len = 4;
+    std::memcpy(req.pin, "2468", 4);
+    uint8_t pt[PinReq::kLen];
+    encode(req, pt);
+    uint8_t f[kMaxFrame];
+    size_t n = seal_frame(k, kNet, Header{MsgType::PinReq, 0, 3, 42}, pt, sizeof(pt), f, sizeof(f));
+    EXPECT_EQ(testutil::bytes(f, n), testutil::hex("180003002a00000054b62e4cced7ed2f15752d778d3af7cc0e29"));
+
+    PinResp resp{42, Decision::Grant, Reason::Ok, 5000, 0, {}};
+    std::memcpy(resp.name, "Dan", 3);
+    uint8_t rp[PinResp::kLen];
+    encode(resp, rp);
+    n = seal_frame(k, kNet, Header{MsgType::PinResp, 0, 3, 7}, rp, sizeof(rp), f, sizeof(f));
+    EXPECT_EQ(testutil::bytes(f, n),
+              testutil::hex("19000300070000009bac2719cda2831474e2e0785f908a958ed37e4e68e52d3dc31beb0cd821468be039"));
 }

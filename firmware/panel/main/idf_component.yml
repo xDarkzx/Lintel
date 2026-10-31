@@ -1,6 +1,8 @@
 dependencies:
   idf: ">=5.4"
   lvgl/lvgl: "8.4.*"
-  # Must match the esp_hosted slave on the onboard ESP32-C6 (2.12.8).
-  espressif/esp_hosted: "2.12.8"
-  espressif/esp_wifi_remote: "1.2.*"
+  # Data link to the door controller over the native high-speed USB-OTG port.
+  espressif/esp_tinyusb: "1.7.6~2"
+  # Camera: OV02C10 needs esp_cam_sensor 1.2.1 (vendored in components/), which only
+  # builds against esp_video 1.1.0. Same pins as infinity_face.
+  espressif/esp_video: "==1.1.0"

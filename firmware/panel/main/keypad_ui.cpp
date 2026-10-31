@@ -469,12 +469,12 @@ void ui_begin(const char* door_name, SubmitFn on_submit, void* ctx) {
     ESP_LOGI(TAG, "keypad up");
 }
 
-void ui_set_link(bool wifi, bool server, int rssi) {
+void ui_set_link(bool wired, bool server, int rssi) {
     bsp_display_lock(0);
     const char* text = "Secure link";
     uint32_t c = kGreen;
-    if (!wifi) {
-        text = "No Wi-Fi";
+    if (!wired) {
+        text = "No controller";
         c = kRed;
     } else if (!server) {
         text = "Server offline";

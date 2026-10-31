@@ -1,7 +1,6 @@
-idf_component_register(SRCS main.cpp keypad_ui.cpp
-                       INCLUDE_DIRS .
-                       REQUIRES lintel_core lintel_platform
-                       PRIV_REQUIRES nvs_flash esp_netif esp_event esp_wifi esp_timer console lwip
-                                     espressif__esp32_p4_function_ev_board)
+# No REQUIRES list: like infinity_face, main sees every component, which the
+# camera stack (esp_video, esp_cam_sensor, JPEG driver) needs.
+idf_component_register(SRCS main.cpp keypad_ui.cpp usb_link.cpp camera.cpp app_video.c
+                       INCLUDE_DIRS .)
 idf_component_get_property(LVGL_LIB lvgl__lvgl COMPONENT_LIB)
 target_compile_options(${LVGL_LIB} PRIVATE -DLV_LVGL_H_INCLUDE_SIMPLE)

@@ -1,31 +1,32 @@
-// Lintel keypad panel: Guition JC4880P443C (ESP32-P4 + ESP32-C6 Wi-Fi).
+// Lintel keypad panel: Guition JC4880P443C (ESP32-P4).
 //
-// The panel holds no PINs. It seals each entry into an AES-128-CCM frame,
-// sends it to the server over UDP and acts only on the reply that answers
-// that exact request.
+// No radios. The panel is wired over USB to its door controller (a Pi Zero
+// or similar), which relays frames to the server. The panel holds no PINs:
+// each entry is sealed into an AES-128-CCM frame for the server, and the
+// panel acts only on the reply that answers that exact request. After a
+// grant it photographs the person and sends a signed JPEG for the record.
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <sys/time.h>
 
+#include "camera.h"
 #include "esp_console.h"
-#include "esp_event.h"
 #include "esp_log.h"
-#include "esp_netif.h"
-#include "esp_netif_sntp.h"
 #include "esp_system.h"
 #include "esp_timer.h"
-#include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
 #include "keypad_ui.h"
 #include "lintel/bytes.h"
 #include "lintel/counters.h"
+#include "lintel/crypto.h"
 #include "lintel/frame.h"
 #include "lintel/messages.h"
 #include "lintel_kv.h"
-#include "lwip/sockets.h"
 #include "sdkconfig.h"
+#include "usb_link.h"
 
 namespace panel {
 
@@ -39,21 +40,17 @@ constexpr uint32_t kRespTimeoutMs = 2500;
 constexpr uint32_t kAckTimeoutMs = 1500;
 constexpr uint32_t kHeartbeatMs = 5000;
 constexpr int kMissedForOffline = 2;
+constexpr uint16_t kPhotoChunk = 1000;
 
 struct Config {
     uint16_t door_id;
     uint32_t net_id;
     Key key;
-    char server[40];
-    uint16_t port;
 };
 
 Config s_cfg = {};
-volatile bool s_wifi_up = false;
-int s_rssi = 0;
 QueueHandle_t s_pin_q = nullptr;
-int s_sock = -1;
-sockaddr_in s_server = {};
+QueueHandle_t s_down_q = nullptr;  // sealed frames arriving from the controller
 
 bool persist_ceiling(void*, uint32_t c) { return kv_set_u32("tx_ceil", c); }
 TxCounter s_tx(64, &persist_ceiling, nullptr);
@@ -63,77 +60,37 @@ struct PinMsg {
     char pin[kPinMaxLen + 1];
 };
 
+struct DownFrame {
+    uint8_t len;
+    uint8_t data[kMaxFrame];
+};
+
 uint32_t now_ms() { return static_cast<uint32_t>(esp_timer_get_time() / 1000); }
 
-// ---- Wi-Fi ------------------------------------------------------------------
-
-void on_wifi(void*, esp_event_base_t base, int32_t id, void* data) {
-    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
-    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
-        s_wifi_up = false;
-        esp_wifi_connect();
-    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
-        auto* ev = static_cast<ip_event_got_ip_t*>(data);
-        ESP_LOGI(TAG, "wifi up, ip " IPSTR, IP2STR(&ev->ip_info.ip));
-        s_wifi_up = true;
-        static bool sntp_started = false;
-        if (!sntp_started) {
-            sntp_started = true;
-            esp_sntp_config_t sc = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
-            esp_netif_sntp_init(&sc);
-        }
-    }
+// Server time from the last heartbeat ack, for the on-screen clock.
+void set_clock(uint32_t epoch) {
+    timeval tv{static_cast<time_t>(epoch), 0};
+    settimeofday(&tv, nullptr);
 }
 
-void wifi_begin() {
-    esp_netif_init();
-    esp_event_loop_create_default();
-    esp_netif_create_default_wifi_sta();
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-    esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, on_wifi, nullptr);
-    esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, on_wifi, nullptr);
-    esp_wifi_set_mode(WIFI_MODE_STA);
+// ---- controller link ----------------------------------------------------------
 
-    // Credentials: NVS (console `wifi`), then Kconfig, else what the C6 has stored.
-    char ssid[33] = {}, pass[65] = {};
-    bool have = kv_get_blob("wifi_ssid", ssid, sizeof(ssid)) && kv_get_blob("wifi_pass", pass, sizeof(pass));
-    if (!have && std::strlen(CONFIG_PANEL_WIFI_SSID) > 0) {
-        std::snprintf(ssid, sizeof(ssid), "%s", CONFIG_PANEL_WIFI_SSID);
-        std::snprintf(pass, sizeof(pass), "%s", CONFIG_PANEL_WIFI_PASS);
-        have = true;
-    }
-    if (have) {
-        wifi_config_t wc = {};
-        std::memcpy(wc.sta.ssid, ssid, sizeof(wc.sta.ssid));
-        std::memcpy(wc.sta.password, pass, sizeof(wc.sta.password));
-        esp_wifi_set_config(WIFI_IF_STA, &wc);
-    }
-    esp_wifi_start();
-}
-
-// ---- Server link --------------------------------------------------------------
-
-bool open_socket() {
-    s_server = {};
-    s_server.sin_family = AF_INET;
-    s_server.sin_port = htons(s_cfg.port);
-    if (inet_pton(AF_INET, s_cfg.server, &s_server.sin_addr) != 1) {
-        ESP_LOGE(TAG, "bad server address '%s'", s_cfg.server);
-        return false;
-    }
-    s_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    return s_sock >= 0;
+void on_down_frame(const uint8_t* f, size_t len, void*) {
+    if (len == 0 || len > kMaxFrame) return;
+    DownFrame d;
+    d.len = static_cast<uint8_t>(len);
+    std::memcpy(d.data, f, len);
+    xQueueSend(s_down_q, &d, 0);
 }
 
 bool send_frame(MsgType type, const uint8_t* pt, size_t len, uint32_t& ctr) {
-    if (s_sock < 0 || !s_tx.next(ctr)) return false;
+    if (!s_tx.next(ctr)) return false;
     Header h{type, 0, s_cfg.door_id, ctr};
     uint8_t f[kMaxFrame];
     size_t n = seal_frame(s_cfg.key, s_cfg.net_id, h, pt, len, f, sizeof(f));
     if (n == 0) return false;
-    return sendto(s_sock, f, n, 0, reinterpret_cast<sockaddr*>(&s_server), sizeof(s_server)) == static_cast<int>(n);
+    usb_link_send(kLinkFrameUp, f, static_cast<uint16_t>(n));
+    return true;
 }
 
 // Where each reply type carries the counter of the request it answers.
@@ -144,21 +101,17 @@ size_t bound_counter_offset(MsgType t) { return t == MsgType::HeartbeatAck ? 7 :
 bool await_reply(MsgType type, uint32_t ctr, uint8_t* pt, size_t& len, uint32_t timeout_ms) {
     uint32_t deadline = now_ms() + timeout_ms;
     size_t off = bound_counter_offset(type);
+    DownFrame d;
     for (;;) {
         int32_t left = static_cast<int32_t>(deadline - now_ms());
-        if (left <= 0) return false;
-        timeval tv{left / 1000, (left % 1000) * 1000};
-        setsockopt(s_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        uint8_t f[kMaxFrame];
-        int n = recv(s_sock, f, sizeof(f), 0);
-        if (n <= 0) continue;
+        if (left <= 0 || xQueueReceive(s_down_q, &d, pdMS_TO_TICKS(left)) != pdTRUE) return false;
         Header h{};
-        if (!peek_header(f, static_cast<size_t>(n), h) || h.door_id != s_cfg.door_id) continue;
+        if (!peek_header(d.data, d.len, h) || h.door_id != s_cfg.door_id) continue;
         if (!s_rx.accepts(h.counter)) {
             ESP_LOGW(TAG, "replayed frame dropped (ctr %lu)", static_cast<unsigned long>(h.counter));
             continue;
         }
-        if (!open_frame(s_cfg.key, s_cfg.net_id, f, static_cast<size_t>(n), h, pt, kMaxPayload, len)) {
+        if (!open_frame(s_cfg.key, s_cfg.net_id, d.data, d.len, h, pt, kMaxPayload, len)) {
             ESP_LOGW(TAG, "frame failed authentication, dropped");
             continue;
         }
@@ -166,6 +119,45 @@ bool await_reply(MsgType type, uint32_t ctr, uint8_t* pt, size_t& len, uint32_t 
         if (h.type == type && len >= off + 4 && get_u32(pt + off) == ctr) return true;
     }
 }
+
+// ---- entry photo -----------------------------------------------------------------
+
+// Signed so the server can tell the photo came from this panel and belongs
+// to this grant: HMAC(photo_key, "door:req:" || sha256(jpeg)).
+void send_photo(uint32_t req_ctr) {
+    uint8_t* jpg = nullptr;
+    size_t n = 0;
+    if (!camera_snapshot(&jpg, &n, 1500)) {
+        ESP_LOGW(TAG, "no camera frame for grant %lu", static_cast<unsigned long>(req_ctr));
+        return;
+    }
+    static const char kLabel[] = "lintel-photo";
+    uint8_t pkey[kSha256Len], digest[kSha256Len], mac[kSha256Len];
+    char prefix[24];
+    int plen = std::snprintf(prefix, sizeof(prefix), "%u:%lu:", s_cfg.door_id, static_cast<unsigned long>(req_ctr));
+    bool ok = hmac_sha256(s_cfg.key.b, kKeyLen, reinterpret_cast<const uint8_t*>(kLabel), sizeof(kLabel) - 1,
+                          nullptr, 0, pkey) &&
+              sha256(jpg, n, digest) &&
+              hmac_sha256(pkey, sizeof(pkey), reinterpret_cast<const uint8_t*>(prefix), static_cast<size_t>(plen),
+                          digest, sizeof(digest), mac);
+    secure_zero(pkey, sizeof(pkey));
+    if (ok) {
+        uint8_t start[8 + kSha256Len];
+        put_u32(start, req_ctr);
+        put_u32(start + 4, static_cast<uint32_t>(n));
+        std::memcpy(start + 8, mac, sizeof(mac));
+        usb_link_send(kLinkPhotoStart, start, sizeof(start));
+        for (size_t off = 0; off < n; off += kPhotoChunk) {
+            uint16_t c = static_cast<uint16_t>(n - off < kPhotoChunk ? n - off : kPhotoChunk);
+            usb_link_send(kLinkPhotoChunk, jpg + off, c);
+        }
+        usb_link_send(kLinkPhotoEnd, nullptr, 0);
+        ESP_LOGI(TAG, "entry photo sent (%u bytes)", static_cast<unsigned>(n));
+    }
+    free(jpg);
+}
+
+// ---- PIN handling -----------------------------------------------------------------
 
 void on_submit(const char* pin, void*) {
     PinMsg m{};
@@ -186,12 +178,12 @@ void handle_pin(const PinMsg& m) {
     uint8_t reply[kMaxPayload];
     size_t len = 0;
     PinResp resp{};
-    bool ok = s_wifi_up && send_frame(MsgType::PinReq, pt, sizeof(pt), ctr) &&
+    bool ok = usb_link_host_connected() && send_frame(MsgType::PinReq, pt, sizeof(pt), ctr) &&
               await_reply(MsgType::PinResp, ctr, reply, len, kRespTimeoutMs) && decode(reply, len, resp);
     secure_zero(pt, sizeof(pt));
     if (!ok) {
         ESP_LOGW(TAG, "no valid reply from server");
-        ui_show_denied("No answer", "Server unreachable.\nDoor stays locked.");
+        ui_show_denied("No answer", "Controller or server unreachable.\nDoor stays locked.");
         return;
     }
     ESP_LOGI(TAG, "decision %s (%s) in %lu ms", resp.decision == Decision::Grant ? "GRANT" : "DENY",
@@ -200,6 +192,7 @@ void handle_pin(const PinMsg& m) {
         char title[40];
         std::snprintf(title, sizeof(title), "Welcome%s%s", resp.name[0] ? ", " : "", resp.name);
         ui_show_granted(title, "Door unlocked", resp.unlock_ms ? resp.unlock_ms : 5000);
+        send_photo(ctr);
     } else if (resp.reason == Reason::LockedOut) {
         ui_show_lockout(resp.lockout_s ? resp.lockout_s : 30);
     } else if (resp.reason == Reason::Lockdown) {
@@ -214,7 +207,7 @@ void handle_pin(const PinMsg& m) {
 }
 
 bool heartbeat(bool& lockdown) {
-    Heartbeat hb{0, 0, static_cast<int8_t>(s_rssi), 0, now_ms() / 1000, 0};
+    Heartbeat hb{0, 0, 0, 0, now_ms() / 1000, 0};
     uint8_t pt[Heartbeat::kLen];
     encode(hb, pt);
     uint32_t ctr = 0;
@@ -226,6 +219,7 @@ bool heartbeat(bool& lockdown) {
         return false;
     }
     lockdown = ack.mode == SiteMode::Lockdown;
+    if (ack.time > 1700000000u) set_clock(ack.time);
     return true;
 }
 
@@ -238,44 +232,38 @@ void net_task(void*) {
         if (xQueueReceive(s_pin_q, &m, pdMS_TO_TICKS(100)) == pdTRUE) {
             handle_pin(m);
             secure_zero(&m, sizeof(m));
-            next_hb = now_ms();  // refresh link state right after a decision
+            next_hb = now_ms();
         }
         if (static_cast<int32_t>(now_ms() - next_hb) < 0) continue;
         next_hb = now_ms() + kHeartbeatMs;
 
-        wifi_ap_record_t ap{};
-        if (s_wifi_up && esp_wifi_sta_get_ap_info(&ap) == ESP_OK) s_rssi = ap.rssi;
+        bool wired = usb_link_host_connected();
         bool ld = lockdown;
-        bool alive = s_wifi_up && heartbeat(ld);
+        bool alive = wired && heartbeat(ld);
         missed = alive ? 0 : missed + 1;
         if (alive && ld != lockdown) {
             lockdown = ld;
             ui_set_lockdown(ld);
         }
-        ui_set_link(s_wifi_up, missed < kMissedForOffline, s_rssi);
+        ui_set_link(wired, missed < kMissedForOffline, 0);
     }
 }
 
-// ---- Provisioning console ---------------------------------------------------
+// ---- provisioning console (USB-Serial-JTAG port) ------------------------------------------
 
 bool load_config(Config& c) {
-    uint32_t id = 0, port = CONFIG_PANEL_SERVER_PORT;
+    uint32_t id = 0;
     if (!kv_get_u32("door_id", id) || !kv_get_u32("net_id", c.net_id) || !kv_get_blob("k_door", c.key.b, kKeyLen)) {
         return false;
     }
     c.door_id = static_cast<uint16_t>(id);
-    if (!kv_get_blob("server", c.server, sizeof(c.server))) {
-        std::snprintf(c.server, sizeof(c.server), "%s", CONFIG_PANEL_SERVER_HOST);
-    }
-    kv_get_u32("port", port);
-    c.port = static_cast<uint16_t>(port);
     return true;
 }
 
-// prov <door_id> <net_id hex> <door_key hex32> <server_ip> [port]
+// prov <door_id> <net_id hex> <door_key hex32>
 int cmd_prov(int argc, char** argv) {
-    if (argc < 5) {
-        std::printf("usage: prov <door_id> <net_id> <door_key> <server_ip> [port]\n");
+    if (argc < 4) {
+        std::printf("usage: prov <door_id> <net_id> <door_key>\n");
         return 1;
     }
     uint8_t key[kKeyLen];
@@ -283,13 +271,9 @@ int cmd_prov(int argc, char** argv) {
         std::printf("ERR key must be 32 hex chars\n");
         return 1;
     }
-    char server[40] = {};
-    std::snprintf(server, sizeof(server), "%s", argv[4]);
-    uint32_t port = argc > 5 ? static_cast<uint32_t>(std::atoi(argv[5])) : CONFIG_PANEL_SERVER_PORT;
     bool ok = kv_set_u32("door_id", static_cast<uint32_t>(std::atoi(argv[1]))) &&
               kv_set_u32("net_id", static_cast<uint32_t>(std::strtoul(argv[2], nullptr, 16))) &&
-              kv_set_blob("k_door", key, kKeyLen) && kv_set_blob("server", server, sizeof(server)) &&
-              kv_set_u32("port", port) && kv_set_u32("tx_ceil", 0);
+              kv_set_blob("k_door", key, kKeyLen) && kv_set_u32("tx_ceil", 0);
     secure_zero(key, sizeof(key));
     std::printf(ok ? "OK provisioned, rebooting\n" : "ERR NVS write failed\n");
     if (ok) {
@@ -300,28 +284,9 @@ int cmd_prov(int argc, char** argv) {
     return ok ? 0 : 1;
 }
 
-// wifi <ssid> <password>
-int cmd_wifi(int argc, char** argv) {
-    if (argc != 3) {
-        std::printf("usage: wifi <ssid> <password>\n");
-        return 1;
-    }
-    char ssid[33] = {}, pass[65] = {};
-    std::snprintf(ssid, sizeof(ssid), "%s", argv[1]);
-    std::snprintf(pass, sizeof(pass), "%s", argv[2]);
-    bool ok = kv_set_blob("wifi_ssid", ssid, sizeof(ssid)) && kv_set_blob("wifi_pass", pass, sizeof(pass));
-    std::printf(ok ? "OK saved, rebooting\n" : "ERR\n");
-    if (ok) {
-        fflush(stdout);
-        vTaskDelay(pdMS_TO_TICKS(100));
-        esp_restart();
-    }
-    return ok ? 0 : 1;
-}
-
 int cmd_status(int, char**) {
-    std::printf("door=%u server=%s:%u wifi=%d rssi=%d tx_next=%lu\n", s_cfg.door_id, s_cfg.server, s_cfg.port,
-                s_wifi_up, s_rssi, static_cast<unsigned long>(s_tx.peek()));
+    std::printf("door=%u controller=%s tx_next=%lu\n", s_cfg.door_id, usb_link_host_connected() ? "connected" : "absent",
+                static_cast<unsigned long>(s_tx.peek()));
     return 0;
 }
 
@@ -334,12 +299,17 @@ void console_begin() {
     if (esp_console_new_repl_usb_serial_jtag(&dev, &cfg, &repl) != ESP_OK) return;
     esp_console_register_help_command();
     const esp_console_cmd_t cmds[] = {
-        {"prov", "Provision door id, network key and server", nullptr, cmd_prov, nullptr, nullptr, nullptr},
-        {"wifi", "Set Wi-Fi SSID and password", nullptr, cmd_wifi, nullptr, nullptr, nullptr},
+        {"prov", "Provision door id, network id and door key", nullptr, cmd_prov, nullptr, nullptr, nullptr},
         {"status", "Show link state", nullptr, cmd_status, nullptr, nullptr, nullptr},
     };
     for (const auto& c : cmds) esp_console_cmd_register(&c);
     esp_console_start_repl(repl);
+}
+
+// Keep the main task alive instead of returning: deleting it makes the idle
+// task tear down its state, which is where the old reset loop came from.
+[[noreturn]] void park() {
+    for (;;) vTaskDelay(portMAX_DELAY);
 }
 
 }  // namespace
@@ -354,18 +324,21 @@ extern "C" void app_main(void) {
 
     ui_begin(CONFIG_PANEL_DOOR_NAME, on_submit, nullptr);
     ui_set_link(false, false, 0);
-    wifi_begin();
     console_begin();
 
     if (!provisioned) {
         ESP_LOGW(TAG, "not provisioned: run `prov` on the USB console");
-        return;
+        park();
     }
     uint32_t ceiling = 0;
     lintel::kv_get_u32("tx_ceil", ceiling);
     s_tx.resume(ceiling);
-    if (!open_socket()) return;
+
+    s_down_q = xQueueCreate(6, sizeof(DownFrame));
     s_pin_q = xQueueCreate(2, sizeof(PinMsg));
+    usb_link_start(s_cfg.door_id, on_down_frame, nullptr);
+    camera_begin();
     xTaskCreate(net_task, "net", 8192, nullptr, 5, nullptr);
-    ESP_LOGI(TAG, "door %u -> %s:%u", s_cfg.door_id, s_cfg.server, s_cfg.port);
+    ESP_LOGI(TAG, "door %u ready, waiting for controller on USB", s_cfg.door_id);
+    park();
 }

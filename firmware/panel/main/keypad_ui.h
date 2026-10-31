@@ -10,7 +10,7 @@ using SubmitFn = void (*)(const char* pin, void* ctx);
 
 void ui_begin(const char* door_name, SubmitFn on_submit, void* ctx);
 
-void ui_set_link(bool wifi, bool server, int rssi);
+void ui_set_link(bool wired, bool server, int rssi);
 void ui_set_lockdown(bool on);
 
 // Result of a submitted PIN. `title` / `detail` are shown on the overlay.

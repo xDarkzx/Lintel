@@ -1,0 +1,225 @@
+"""Door controller: the UDP endpoint panels talk to.
+
+Authenticates every frame (AES-CCM + replay window), decides PIN entries,
+answers heartbeats, supervises door links and raises alarms.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import hmac
+import logging
+import time
+from dataclasses import dataclass, field
+from typing import Any, Callable
+
+from .access import AccessEngine
+from .protocol import (Decision, FrameError, Header, Heartbeat, HeartbeatAck, MsgType, PinReq, PinResp, Reason,
+                       ReplayWindow, SiteMode, dir_for, Dir, open_frame, peek_header, seal)
+from .store import Store
+
+log = logging.getLogger("lintel.controller")
+
+TX_BLOCK = 64
+SUPERVISE_S = 20.0           # door declared offline after this much silence
+REJECT_LOG_INTERVAL_S = 10.0
+
+REASON_TEXT = {
+    Reason.OK: "granted", Reason.BAD_PIN: "PIN not recognised", Reason.REVOKED: "cardholder inactive or expired",
+    Reason.DOOR_NOT_ALLOWED: "no access to this door", Reason.OUTSIDE_SCHEDULE: "outside schedule",
+    Reason.LOCKDOWN: "site lockdown", Reason.LOCKED_OUT: "keypad locked out",
+}
+
+
+def photo_key(door_key: bytes) -> bytes:
+    """Key a panel uses to sign entry photos; derived from its door key."""
+    return hmac.new(door_key, b"lintel-photo", hashlib.sha256).digest()
+
+
+@dataclass
+class DoorLink:
+    id: int
+    name: str
+    key: bytes
+    unlock_ms: int
+    rx: ReplayWindow
+    tx_next: int
+    tx_ceiling: int
+    online: bool = False
+    last_seen: float = 0.0
+    last_reject_log: float = 0.0
+    rejects: int = 0
+
+
+@dataclass
+class Controller:
+    store: Store
+    engine: AccessEngine
+    publish: Callable[[dict[str, Any]], None]
+    doors: dict[int, DoorLink] = field(default_factory=dict)
+    transport: asyncio.DatagramTransport | None = None
+
+    # ---- door table -----------------------------------------------------------
+
+    def load_doors(self) -> None:
+        for r in self.store.q("SELECT * FROM doors"):
+            self.load_door(r["id"])
+
+    def load_door(self, door_id: int) -> None:
+        r = self.store.q1("SELECT * FROM doors WHERE id=?", (door_id,))
+        if r is None:
+            self.doors.pop(door_id, None)
+            return
+        old = self.doors.get(door_id)
+        # Resume from the persisted ceiling: values below it may have been used.
+        self.doors[door_id] = DoorLink(r["id"], r["name"], bytes(r["key"]), r["unlock_ms"],
+                                       ReplayWindow(r["rx_highest"]), max(1, r["tx_ceiling"]), r["tx_ceiling"],
+                                       online=old.online if old else False, last_seen=old.last_seen if old else 0.0)
+
+    def _next_ctr(self, d: DoorLink) -> int:
+        if d.tx_next >= d.tx_ceiling:
+            d.tx_ceiling = d.tx_next + TX_BLOCK
+            self.store.x("UPDATE doors SET tx_ceiling=? WHERE id=?", (d.tx_ceiling, d.id))
+        c = d.tx_next
+        d.tx_next += 1
+        return c
+
+    def _send(self, d: DoorLink, t: MsgType, payload: bytes, addr: tuple[str, int]) -> None:
+        h = Header(t, 0, d.id, self._next_ctr(d))
+        assert self.transport is not None
+        self.transport.sendto(seal(d.key, self.store.secrets.net_id, h, payload), addr)
+
+    # ---- datagram entry point ------------------------------------------------------
+
+    def datagram(self, data: bytes, addr: tuple[str, int]) -> None:
+        try:
+            h = peek_header(data)
+        except FrameError:
+            return
+        d = self.doors.get(h.door_id)
+        if d is None or dir_for(h.type) != Dir.DOOR_TO_CTRL:
+            return
+        now = time.time()
+        if not d.rx.accepts(h.counter):
+            self._reject(d, now, f"replayed frame ctr={h.counter} from {addr[0]}")
+            return
+        try:
+            h, pt = open_frame(d.key, self.store.secrets.net_id, data)
+        except FrameError:
+            self._reject(d, now, f"forged or corrupted frame from {addr[0]}")
+            return
+        d.rx.commit(h.counter)
+        self.store.x("UPDATE doors SET rx_highest=?, last_seen=?, last_ip=? WHERE id=?",
+                     (d.rx.highest, now, addr[0], d.id))
+        d.last_seen = now
+        if not d.online:
+            d.online = True
+            ev = self.store.journal("door.online", door_id=d.id, detail=f"{d.name} connected from {addr[0]}")
+            self._clear_alarms(d.id, "door.offline")
+            self.publish({"type": "event", "event": ev})
+            self.publish({"type": "doors"})
+
+        try:
+            if h.type == MsgType.PIN_REQ:
+                self._on_pin(d, h, PinReq.decode(pt), addr, now)
+            elif h.type == MsgType.HEARTBEAT:
+                hb = Heartbeat.decode(pt)
+                self.store.x("UPDATE doors SET rssi=? WHERE id=?", (hb.last_rssi, d.id))
+                ack = HeartbeatAck(self.engine.site_mode(), 0, int(now), h.counter)
+                self._send(d, MsgType.HEARTBEAT_ACK, ack.encode(), addr)
+        except FrameError as e:
+            self._reject(d, now, f"malformed payload: {e}")
+
+    def _reject(self, d: DoorLink, now: float, why: str) -> None:
+        d.rejects += 1
+        log.warning("door %d: %s", d.id, why)
+        # Rate-limited so junk traffic cannot flood the journal.
+        if now - d.last_reject_log >= REJECT_LOG_INTERVAL_S:
+            d.last_reject_log = now
+            ev = self.store.journal("link.rejected", door_id=d.id, detail=why)
+            al = self.store.raise_alarm(2, "link.rejected", f"Rejected traffic at {d.name}", door_id=d.id,
+                                        event_seq=ev["seq"])
+            self.publish({"type": "event", "event": ev})
+            self.publish({"type": "alarm", "alarm": al})
+
+    def _on_pin(self, d: DoorLink, h: Header, req: PinReq, addr: tuple[str, int], now: float) -> None:
+        v = self.engine.decide_pin(d.id, req.pin, now)
+        ch = v.cardholder
+        who = f"{ch['first_name']} {ch['last_name']}" if ch else None
+        granted = v.decision == Decision.GRANT
+
+        resp = PinResp(h.counter, v.decision, v.reason, d.unlock_ms if granted else 0, v.lockout_s,
+                       ch["first_name"] if ch and granted else "")
+        self._send(d, MsgType.PIN_RESP, resp.encode(), addr)
+
+        # A duress grant is journalled as a normal grant; only the alarm says otherwise,
+        # so nothing visible at the door gives the user away.
+        ev = self.store.journal("access.granted" if granted else "access.denied", door_id=d.id,
+                                cardholder_id=ch["id"] if ch else None, decision=v.decision.name.lower(),
+                                reason=v.reason.name.lower(),
+                                detail=f"{who or 'Unknown PIN'} at {d.name}: {REASON_TEXT.get(v.reason, v.reason.name)}",
+                                req_ctr=h.counter)
+        self.publish({"type": "event", "event": ev})
+        log.info("door %d pin -> %s (%s) %s", d.id, v.decision.name, v.reason.name, who or "")
+
+        alarm = None
+        if v.duress:
+            alarm = self.store.raise_alarm(1, "duress", f"DURESS: {who} at {d.name}", door_id=d.id, event_seq=ev["seq"])
+        elif v.lockout_started:
+            alarm = self.store.raise_alarm(2, "keypad.lockout", f"PIN guessing at {d.name}: keypad locked "
+                                           f"{v.lockout_s}s", door_id=d.id, event_seq=ev["seq"])
+        if alarm:
+            self.publish({"type": "alarm", "alarm": alarm})
+
+    # ---- supervision ---------------------------------------------------------------------
+
+    def supervise(self) -> None:
+        now = time.time()
+        for d in self.doors.values():
+            if d.online and now - d.last_seen > SUPERVISE_S:
+                d.online = False
+                ev = self.store.journal("door.offline", door_id=d.id, detail=f"{d.name} stopped responding")
+                al = self.store.raise_alarm(2, "door.offline", f"{d.name} offline", door_id=d.id,
+                                            event_seq=ev["seq"])
+                self.publish({"type": "event", "event": ev})
+                self.publish({"type": "alarm", "alarm": al})
+                self.publish({"type": "doors"})
+
+    def _clear_alarms(self, door_id: int, kind: str) -> None:
+        self.store.x("UPDATE alarms SET state='cleared' WHERE door_id=? AND kind=? AND state!='cleared'",
+                     (door_id, kind))
+        self.publish({"type": "alarms"})
+
+    def set_mode(self, mode: SiteMode, operator: str) -> dict[str, Any]:
+        self.store.set_setting("site_mode", str(int(mode)))
+        ev = self.store.journal("site.mode", operator=operator, detail=f"site mode set to {mode.name.lower()}")
+        if mode == SiteMode.LOCKDOWN:
+            al = self.store.raise_alarm(1, "lockdown", f"Site lockdown started by {operator}", event_seq=ev["seq"])
+            self.publish({"type": "alarm", "alarm": al})
+        self.publish({"type": "event", "event": ev})
+        self.publish({"type": "mode", "mode": int(mode)})
+        return ev
+
+
+class _Proto(asyncio.DatagramProtocol):
+    def __init__(self, ctl: Controller) -> None:
+        self.ctl = ctl
+
+    def connection_made(self, transport: asyncio.BaseTransport) -> None:
+        self.ctl.transport = transport  # type: ignore[assignment]
+
+    def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
+        try:
+            self.ctl.datagram(data, addr)
+        except Exception:  # never let one bad packet stop the listener
+            log.exception("datagram handling failed")
+
+
+async def run_controller(ctl: Controller, host: str, port: int) -> None:
+    loop = asyncio.get_running_loop()
+    await loop.create_datagram_endpoint(lambda: _Proto(ctl), local_addr=(host, port))
+    log.info("door controller listening on udp/%d", port)
+    while True:
+        await asyncio.sleep(2)
+        ctl.supervise()

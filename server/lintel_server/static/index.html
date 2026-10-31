@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lintel Command</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<div id="login" class="login hidden">
+  <form id="login-form" class="login-card">
+    <div class="brand big"><span class="brand-mark"></span>LINTEL</div>
+    <p class="muted">Access control command centre</p>
+    <label>Username<input name="username" autocomplete="username" required></label>
+    <label>Password<input name="password" type="password" autocomplete="current-password" required></label>
+    <button class="btn primary wide">Sign in</button>
+    <p id="login-error" class="error"></p>
+  </form>
+</div>
+
+<div id="app" class="shell hidden">
+  <aside class="nav">
+    <div class="brand"><span class="brand-mark"></span>LINTEL</div>
+    <div id="site-name" class="site-name"></div>
+    <nav id="nav">
+      <a href="#monitor" data-page="monitor"><i>&#9673;</i>Monitor</a>
+      <a href="#alarms" data-page="alarms"><i>&#9888;</i>Alarms<span id="nav-alarms" class="count hidden"></span></a>
+      <a href="#events" data-page="events"><i>&#8801;</i>Events &amp; reports</a>
+      <div class="nav-section">Configuration</div>
+      <a href="#cardholders" data-page="cardholders"><i>&#9786;</i>Cardholders</a>
+      <a href="#groups" data-page="groups"><i>&#9638;</i>Access groups</a>
+      <a href="#schedules" data-page="schedules"><i>&#9719;</i>Schedules</a>
+      <a href="#doors" data-page="doors"><i>&#9707;</i>Doors</a>
+      <div class="nav-section">System</div>
+      <a href="#operators" data-page="operators" data-role="admin"><i>&#9881;</i>Operators</a>
+      <a href="#audit" data-page="audit"><i>&#10003;</i>Audit integrity</a>
+    </nav>
+    <div class="nav-foot"><span id="ws-dot" class="dot amber"></span><span id="ws-text">connecting</span></div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <h1 id="page-title">Monitor</h1>
+      <div class="topbar-right">
+        <div class="mode-switch" id="mode-switch">
+          <button data-mode="0">Normal</button>
+          <button data-mode="1">Lockdown</button>
+          <button data-mode="2">Free access</button>
+        </div>
+        <div class="user"><span id="user-name"></span><span id="user-role" class="role"></span>
+          <button id="logout" class="btn ghost small">Sign out</button></div>
+      </div>
+    </header>
+    <div id="lockdown-strip" class="strip hidden">&#9888; SITE LOCKDOWN ACTIVE &mdash; only override cardholders can enter</div>
+    <div id="free-strip" class="strip amber hidden">&#9888; FREE ACCESS &mdash; doors released, schedules suspended</div>
+    <section id="page" class="page"></section>
+  </main>
+</div>
+
+<div id="drawer" class="drawer hidden"><div class="drawer-panel"><div id="drawer-body"></div></div></div>
+<div id="lightbox" class="lightbox hidden"><img alt="Entry photo"><div class="lightbox-cap"></div></div>
+<div id="toast" class="toast hidden"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>
