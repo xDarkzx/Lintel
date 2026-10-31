@@ -75,6 +75,58 @@ function dialog({ title, text = "", tone = "", ic = "info-circle", confirm = "Co
   });
 }
 
+// ---------- guided face enrolment ----------
+// The browser only films and shows guidance; the server sets the steps,
+// judges every frame for liveness and decides when enrolment is complete.
+const STEP_LABEL = { front: "Look ahead", left: "Turn left", right: "Turn right" };
+async function liveEnrol(c, done) {
+  let s, stream;
+  try { s = await api(`/api/cardholders/${c.id}/faces/enrolment`, { method: "POST" }); } catch (err) { return fail(err); }
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" }, audio: false });
+  } catch (err) { return toast(`Camera unavailable: ${err.message || err.name}`, "bad"); }
+  const m = $("#modal"), body = $("#modal-body");
+  body.classList.add("enrol");
+  body.innerHTML = `<h3>Enrol ${esc(c.first_name)}'s face</h3>
+    <p>Follow the steps. Every frame is checked on the server for a live face; photos and screens are refused.</p>
+    <div class="enrol-cam"><video id="en-video" autoplay playsinline muted></video><div class="enrol-ring"></div></div>
+    <ol class="enrol-steps" id="en-steps">${s.steps.map((k) => `<li>${STEP_LABEL[k]}</li>`).join("")}</ol>
+    <div class="enrol-say" id="en-say"></div><div class="enrol-msg" id="en-msg"></div>
+    <div class="modal-acts"><button class="btn" id="en-close">Cancel</button></div>`;
+  m.onclick = null;
+  m.classList.remove("hidden");
+  let running = true;
+  const stop = () => { running = false; stream.getTracks().forEach((t) => t.stop()); };
+  $("#en-close").addEventListener("click", () => { stop(); m.classList.add("hidden"); body.classList.remove("enrol"); });
+  const show = (r) => {
+    $$("#en-steps li").forEach((li, i) => (li.className = i < r.step ? "done" : i === r.step && r.state === "active" ? "now" : ""));
+    $("#en-say").textContent = r.instruction || (r.state === "saved" ? "Enrolment complete" : r.state === "failed" ? "Enrolment failed" : "");
+    $("#en-msg").textContent = r.message || "";
+    $("#en-msg").className = `enrol-msg ${r.state === "failed" ? "bad" : r.state === "saved" ? "ok" : ""}`;
+  };
+  show(s);
+  const video = $("#en-video");
+  await new Promise((res) => { video.onloadedmetadata = res; video.srcObject = stream; });
+  const canvas = document.createElement("canvas");
+  while (running) {
+    canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+    canvas.getContext("2d").drawImage(video, 0, 0);  // unmirrored: the server reads left and right from it
+    const blob = await new Promise((res) => canvas.toBlob(res, "image/jpeg", 0.9));
+    let r;
+    try { r = await api(`/api/faces/enrolment/${s.id}/frame`, { body: blob, headers: { "Content-Type": "image/jpeg" } }); }
+    catch (err) { stop(); return fail(err); }
+    if (!running) return;
+    show(r);
+    if (r.state !== "active") {
+      stop();
+      $("#en-close").textContent = "Close";
+      if (r.state === "saved") { toast(r.message); done(); }
+      return;
+    }
+    await new Promise((res) => setTimeout(res, 250));
+  }
+}
+
 // ---------- side panel ----------
 let panelState = null;
 function openPanel(html, state = {}) {
@@ -258,6 +310,9 @@ function eventInfo(e) {
   if (k === "site.mode") return ["violet", "broadcast", "Site mode"];
   if (k === "photo.attached") return ["", "photo", "Photo stored"];
   if (k === "door.remote_unlock") return ["warn", "lock-access", "Remote unlock"];
+  if (k === "door.passage") return ["ok", "door-enter", "Passage verified"];
+  if (k === "door.tailgating") return ["bad", "users-group", "Tailgating"];
+  if (k === "watch.failed") return ["warn", "alert-triangle", "Door watch failed"];
   if (k.startsWith("device.")) return ["info", "cpu", "Device " + k.split(".")[1].replace(/_/g, " ")];
   if (k.startsWith("alarm.")) return ["warn", "bell", "Alarm " + k.split(".")[1]];
   if (k.startsWith("operator.")) return ["", "user-shield", "Operator " + k.split(".")[1].replace(/_/g, " ")];
@@ -498,7 +553,7 @@ async function cardholderPanel(id) {
         ${ro || !doors.length ? "" : `<select id="enrol-door" style="width:150px">${doors.map((d) => `<option value="${d.id}">${esc(d.name)}</option>`).join("")}</select>
         <button class="btn sm" data-c="card">${c.has_card ? "Replace" : "Enrol"}</button>${c.has_card ? `<button class="btn sm ghost" data-c="card-off">Remove</button>` : ""}`}</div>
       <div class="cred-row"><span class="cred ${c.faces ? "on" : ""}">${icon("face-id")}</span><div class="grow"><b>Face</b><small>${c.faces ? `${c.faces} template${c.faces > 1 ? "s" : ""} enrolled` : "Not enrolled"}</small></div>
-        ${ro ? "" : `<label class="btn sm">${icon("photo", "sm")}Upload<input type="file" accept="image/jpeg,image/png" id="face-file" class="hidden"></label>${c.faces ? `<button class="btn sm ghost" data-c="face-off">Remove</button>` : ""}`}</div>
+        ${ro ? "" : `<button class="btn sm primary" data-c="face-live">${icon("camera", "sm")}Enrol with camera</button><label class="btn sm">${icon("photo", "sm")}Upload<input type="file" accept="image/jpeg,image/png" id="face-file" class="hidden"></label>${c.faces ? `<button class="btn sm ghost" data-c="face-off">Remove</button>` : ""}`}</div>
       ${ro ? "" : `<div class="section">Enrol a face from recent entry photos</div><div id="pick" class="pick"></div><p class="muted" style="font-size:12.5px;margin-top:8px">Pick a clear, front-facing photo. Two or three from different days improve matching.</p>`}`;
     if (!ro) {
       const photos = await api(`/api/cardholders/${c.id}/photos`);
@@ -533,6 +588,8 @@ async function cardholderPanel(id) {
           await api(`/api/cardholders/${c.id}/card`, { method: "DELETE" }); reload();
         } else if (what === "face-off") {
           await api(`/api/cardholders/${c.id}/faces`, { method: "DELETE" }); reload();
+        } else if (what === "face-live") {
+          await liveEnrol(c, reload);
         }
       } catch (err) { fail(err); }
     }));
@@ -882,6 +939,9 @@ PAGES.settings = async (el) => {
         <label class="field"><span>Rotate door keys every (days)</span><input name="rekey_days" type="number" min="1" max="365" value="${s.rekey_days}">
           <small>New keys are delivered to adopted panels automatically.</small></label>
         <label class="chk" style="align-self:flex-start"><input type="checkbox" name="require_admin_mfa" ${s.require_admin_mfa ? "checked" : ""}>Require two-factor sign-in for admins</label>
+        <div class="field"><label class="chk" style="align-self:flex-start"><input type="checkbox" name="tailgate_detection" ${s.tailgate_detection ? "checked" : ""}>Detect tailgating at keypads</label>
+          <small>${s.tailgate_available ? "After each grant the keypad watches the open door; more people than credentials raises an alarm. People are counted, not identified, and frames are deleted unless they are evidence."
+            : `<span style="color:var(--warn)">Unavailable: the person detection model is not installed on this server.</span>`}</small></div>
         ${ro ? "" : `<div class="actions" style="justify-content:flex-end"><button class="btn primary">Save settings</button></div>`}</form></div></div>
       <div class="card"><div class="card-head"><h2>Trust</h2></div><div class="card-body stack">
         <div class="kvs">${kv("Server certificate (SHA-256)", s.tls_fingerprint ? `<span class="mono">${s.tls_fingerprint.match(/.{1,16}/g).join(" ")}</span>` : "HTTPS not active")}
@@ -930,7 +990,7 @@ PAGES.settings = async (el) => {
   $("#sf").addEventListener("submit", async (e) => {
     e.preventDefault(); const f = new FormData(e.target);
     try {
-      await api("/api/settings", { method: "PATCH", body: { site_name: f.get("site_name"), photo_retention_days: Number(f.get("photo_retention_days")), rekey_days: Number(f.get("rekey_days")), require_admin_mfa: f.has("require_admin_mfa") } });
+      await api("/api/settings", { method: "PATCH", body: { site_name: f.get("site_name"), photo_retention_days: Number(f.get("photo_retention_days")), rekey_days: Number(f.get("rekey_days")), require_admin_mfa: f.has("require_admin_mfa"), tailgate_detection: f.has("tailgate_detection") } });
       toast("Settings saved"); setSys();
     } catch (err) { fail(err); }
   });

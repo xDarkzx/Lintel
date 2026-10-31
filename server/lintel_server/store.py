@@ -275,7 +275,8 @@ class Store:
         # Round-the-clock schedules ignore holidays; everything else closes on them.
         self.x("UPDATE schedules SET observe_holidays = CASE WHEN name='24/7' THEN 0 ELSE 1 END "
                "WHERE observe_holidays IS NULL")
-        for k, v in (("photo_retention_days", "90"), ("rekey_days", "30"), ("require_admin_mfa", "0")):
+        for k, v in (("photo_retention_days", "90"), ("rekey_days", "30"), ("require_admin_mfa", "0"),
+                     ("tailgate_detection", "1")):
             if not self.setting(k):
                 self.set_setting(k, v)
 

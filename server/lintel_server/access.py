@@ -103,7 +103,9 @@ class AccessEngine:
         return False
 
     def decide_pin(self, door_id: int, pin: str, now: float | None = None) -> Verdict:
-        return self.decide(door_id, pin=pin, now=now)
+        # A bare PIN request must respect the door's mode too, or a PIN alone
+        # would open a card-only or face + PIN door.
+        return self.decide(door_id, pin=pin, now=now, enforce_mode=True)
 
     def decide(self, door_id: int, *, pin: str | None = None, card: bytes | None = None,
                face: tuple[int | None, float] | None = None, now: float | None = None,

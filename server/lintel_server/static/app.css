@@ -245,3 +245,16 @@ td .two { display: flex; flex-direction: column; } td .two small { color: var(--
 
 @media (max-width: 1200px) { .monitor { grid-template-columns: 1fr; } .stats { grid-template-columns: repeat(2, 1fr); } }
 @media (max-width: 860px) { .shell { grid-template-columns: 1fr; } .side { display: none; } .search { width: auto; flex: 1; } }
+
+/* guided face enrolment */
+.modal.enrol { width: 560px; }
+.enrol-cam { position: relative; border-radius: 12px; overflow: hidden; background: #0b1220; aspect-ratio: 4 / 3; }
+.enrol-cam video { width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); display: block; }
+.enrol-ring { position: absolute; left: 50%; top: 50%; width: 50%; height: 76%; transform: translate(-50%, -50%); border: 3px solid rgba(255, 255, 255, .9); border-radius: 50%; box-shadow: 0 0 0 999px rgba(15, 23, 42, .4); }
+.enrol-steps { display: flex; gap: 8px; list-style: none; padding: 0; margin: 14px 0 8px; }
+.enrol-steps li { flex: 1; text-align: center; font-size: 12px; font-weight: 500; padding: 6px 4px; border-radius: 8px; border: 1px solid var(--line); color: var(--muted); }
+.enrol-steps li.now { border-color: var(--accent); color: var(--accent-text); background: var(--accent-soft); }
+.enrol-steps li.done { border-color: transparent; color: var(--ok); background: var(--ok-soft); }
+.enrol-say { font-size: 16px; font-weight: 600; text-align: center; }
+.enrol-msg { text-align: center; font-size: 13px; color: var(--text-2); min-height: 18px; margin-top: 4px; }
+.enrol-msg.bad { color: var(--bad); } .enrol-msg.ok { color: var(--ok); }

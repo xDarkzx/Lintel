@@ -96,6 +96,23 @@ followed by a screenshot silently lost the unlock, because the server held one
 pending command per door; found while testing on hardware, fixed with a queue
 and a test.
 
+**A new test exposed an old bypass.** Writing the test for face + PIN doors,
+the agent checked the negative case too: the right PIN with no face. It opened
+the door. The decision engine checked a door's credential mode only for
+combined requests, so a bare PIN request opened face + PIN doors, and
+card-only doors too. *Caught by: a test asserting what must fail, not just
+what must pass. Fix: every request is checked against the door's mode, with
+a test for each mode.*
+
+**Its own hardening blocked its own feature, twice.** The camera for guided
+enrolment would have been refused by the browser: an earlier hardening pass
+had set `Permissions-Policy: camera=()`. Caught by reading the headers before
+shipping the feature that needed them. The same pass hid the API docs, which
+the container health check was polling, so the server had reported itself
+unhealthy ever since; nobody noticed until the agent looked at `docker ps`.
+*Lesson: a security change needs a check that the system still works, not
+just that the hole is closed.*
+
 ## What it was genuinely good at
 
 - Writing the protocol core, X25519 adoption and TOTP against published test

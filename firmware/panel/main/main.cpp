@@ -4,7 +4,8 @@
 // or similar), which relays frames to the server. The panel holds no PINs:
 // each entry is sealed into an AES-128-CCM frame for the server, and the
 // panel acts only on the reply that answers that exact request. After a
-// grant it photographs the person and sends a signed JPEG for the record.
+// grant it photographs the person and sends a signed JPEG for the record,
+// then watches the open door so the server can count who walks through.
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -17,6 +18,7 @@
 #include "identity.h"
 #include "esp_console.h"
 #include "esp_log.h"
+#include "esp_random.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -46,8 +48,11 @@ constexpr uint32_t kAckTimeoutMs = 1500;
 constexpr uint32_t kHeartbeatMs = 5000;
 constexpr int kMissedForOffline = 2;
 constexpr uint16_t kPhotoChunk = 1000;
-constexpr const char* kFirmware = "0.4.0";
+constexpr const char* kFirmware = "0.5.0";
 constexpr uint32_t kDiagMs = 30000;
+constexpr uint32_t kWatchIntervalMs = 350;  // about three frames a second while the door is open
+constexpr uint32_t kWatchTailMs = 2000;     // and a little after it relocks
+constexpr uint8_t kWatchMaxFrames = 24;
 
 struct Config {
     uint16_t door_id;
@@ -66,6 +71,9 @@ uint32_t s_adopt_seq = 0;
 volatile bool s_server_unassigned = false;  // the server's view wins over what NVS holds
 QueueHandle_t s_pin_q = nullptr;
 QueueHandle_t s_down_q = nullptr;  // sealed frames arriving from the controller
+QueueHandle_t s_watch_q = nullptr; // grants whose open door should be recorded
+volatile uint8_t s_cred_mode = 0;  // what this door accepts, from the server's heartbeat ack
+uint32_t s_face_ref = 0;           // reference tying a face image to the request that uses it
 
 bool persist_ceiling(void*, uint32_t c) { return kv_set_u32("tx_ceil", c); }
 TxCounter s_tx(64, &persist_ceiling, nullptr);
@@ -78,6 +86,11 @@ struct PinMsg {
 struct DownFrame {
     uint8_t len;
     uint8_t data[kMaxFrame];
+};
+
+struct WatchReq {
+    uint32_t req_ctr;
+    uint32_t unlock_ms;
 };
 
 uint32_t now_ms() { return static_cast<uint32_t>(esp_timer_get_time() / 1000); }
@@ -239,6 +252,66 @@ void send_photo(uint32_t req_ctr, uint8_t* jpg, size_t n) {
     free(jpg);
 }
 
+// ---- open-door watch (tailgating) -----------------------------------------------------------
+
+// One frame of the burst, signed with its place in the burst and its capture
+// time: HMAC(photo_key, "watch:door:req:index:total:ms:" || sha256(jpeg)).
+// The controller relaying it can neither add, drop nor reorder frames unseen.
+void send_watch_frame(uint32_t req_ctr, uint8_t index, uint8_t total, uint32_t ms, const uint8_t* jpg, size_t n) {
+    static const char kLabel[] = "lintel-photo";
+    uint8_t pkey[kSha256Len], digest[kSha256Len], mac[kSha256Len];
+    char prefix[64];
+    int plen = std::snprintf(prefix, sizeof(prefix), "watch:%u:%lu:%u:%u:%lu:", s_cfg.door_id,
+                             static_cast<unsigned long>(req_ctr), index, total, static_cast<unsigned long>(ms));
+    bool ok = hmac_sha256(s_cfg.key.b, kKeyLen, reinterpret_cast<const uint8_t*>(kLabel), sizeof(kLabel) - 1,
+                          nullptr, 0, pkey) &&
+              sha256(jpg, n, digest) &&
+              hmac_sha256(pkey, sizeof(pkey), reinterpret_cast<const uint8_t*>(prefix), static_cast<size_t>(plen),
+                          digest, sizeof(digest), mac);
+    secure_zero(pkey, sizeof(pkey));
+    if (!ok) return;
+    uint8_t start[14 + kSha256Len];
+    put_u32(start, req_ctr);
+    start[4] = index;
+    start[5] = total;
+    put_u32(start + 6, ms);
+    put_u32(start + 10, static_cast<uint32_t>(n));
+    std::memcpy(start + 14, mac, sizeof(mac));
+    usb_link_send(kLinkWatchStart, start, sizeof(start));
+    for (size_t off = 0; off < n; off += kPhotoChunk) {
+        uint16_t c = static_cast<uint16_t>(n - off < kPhotoChunk ? n - off : kPhotoChunk);
+        usb_link_send(kLinkWatchChunk, jpg + off, c);
+    }
+    usb_link_send(kLinkWatchEnd, nullptr, 0);
+}
+
+// Records the doorway for as long as it is unlocked, plus a short tail, so
+// the server can compare the people who went through with the credentials
+// used. Runs beside the PIN flow; the camera and the link are both locked.
+void watch_task(void*) {
+    WatchReq w{};
+    for (;;) {
+        if (xQueueReceive(s_watch_q, &w, portMAX_DELAY) != pdTRUE) continue;
+        uint32_t window = w.unlock_ms + kWatchTailMs;
+        uint32_t frames = window / kWatchIntervalMs + 1;
+        uint8_t total = static_cast<uint8_t>(frames < kWatchMaxFrames ? frames : kWatchMaxFrames);
+        uint32_t t0 = now_ms();
+        uint8_t sent = 0;
+        for (uint8_t i = 0; i < total; ++i) {
+            int32_t wait = static_cast<int32_t>(t0 + i * kWatchIntervalMs - now_ms());
+            if (wait > 0) vTaskDelay(pdMS_TO_TICKS(wait));
+            uint8_t* jpg = nullptr;
+            size_t n = 0;
+            if (!camera_snapshot(&jpg, &n, 600)) continue;
+            send_watch_frame(w.req_ctr, i, total, now_ms() - t0, jpg, n);
+            free(jpg);
+            ++sent;
+        }
+        ESP_LOGI(TAG, "door watch for request %lu: %u of %u frames sent", static_cast<unsigned long>(w.req_ctr), sent,
+                 total);
+    }
+}
+
 // ---- lock output ---------------------------------------------------------------------
 
 esp_timer_handle_t s_relock = nullptr;
@@ -381,25 +454,49 @@ void on_submit(const char* pin, void*) {
 }
 
 void handle_pin(const PinMsg& m) {
-    PinReq req{};
-    req.pin_len = static_cast<uint8_t>(std::strlen(m.pin));
-    std::memcpy(req.pin, m.pin, req.pin_len);
-    uint8_t pt[PinReq::kLen];
-    encode(req, pt);
-    secure_zero(&req, sizeof(req));
-
     // Photograph the person at the moment they press OK, before the decision,
     // while they are still facing the panel. Every attempt is recorded.
     uint8_t* jpg = nullptr;
     size_t jpg_len = 0;
     if (!camera_snapshot(&jpg, &jpg_len, 600)) jpg = nullptr;
 
+    // Face + PIN doors decide on both at once: the signed face image goes
+    // first (the controller delivers it before relaying anything else), then
+    // one request carrying the PIN and the image's reference.
+    bool face_pin = s_cred_mode == static_cast<uint8_t>(CredMode::FaceAndPin);
+    uint8_t pt[CredReq::kLen > PinReq::kLen ? CredReq::kLen : PinReq::kLen] = {};
+    size_t pt_len = 0;
+    MsgType type = MsgType::PinReq;
+    uint8_t pin_len = static_cast<uint8_t>(std::strlen(m.pin));
+    if (face_pin) {
+        if (jpg == nullptr) {
+            ui_show_denied("Camera unavailable", "This door needs your face and PIN.\nDoor stays locked.");
+            return;
+        }
+        if (++s_face_ref == 0) ++s_face_ref;  // the server treats 0 as "no face"
+        send_media(3, "face", s_face_ref, jpg, jpg_len);
+        CredReq c{};
+        c.present = kCredPin | kCredFace;
+        c.pin_len = pin_len;
+        std::memcpy(c.pin, m.pin, pin_len);
+        c.face_ref = s_face_ref;
+        pt_len = encode(c, pt);
+        secure_zero(&c, sizeof(c));
+        type = MsgType::CredReq;
+    } else {
+        PinReq req{};
+        req.pin_len = pin_len;
+        std::memcpy(req.pin, m.pin, pin_len);
+        pt_len = encode(req, pt);
+        secure_zero(&req, sizeof(req));
+    }
+
     uint32_t ctr = 0;
     uint32_t t0 = now_ms();
     uint8_t reply[kMaxPayload];
     size_t len = 0;
     PinResp resp{};
-    bool ok = usb_link_host_connected() && send_frame(MsgType::PinReq, pt, sizeof(pt), ctr) &&
+    bool ok = usb_link_host_connected() && send_frame(type, pt, pt_len, ctr) &&
               await_reply(MsgType::PinResp, ctr, reply, len, kRespTimeoutMs) && decode(reply, len, resp);
     secure_zero(pt, sizeof(pt));
     if (!ok) {
@@ -417,6 +514,8 @@ void handle_pin(const PinMsg& m) {
         uint32_t unlock = resp.unlock_ms ? resp.unlock_ms : 5000;
         lock_release_for(unlock);
         ui_show_granted(title, "Door unlocked", unlock);
+        WatchReq w{ctr, unlock};
+        if (xQueueSend(s_watch_q, &w, 0) != pdTRUE) ESP_LOGW(TAG, "door watch queue full; this entry is not watched");
     } else if (resp.reason == Reason::LockedOut) {
         ui_show_lockout(resp.lockout_s ? resp.lockout_s : 30);
     } else if (resp.reason == Reason::Lockdown) {
@@ -426,9 +525,13 @@ void handle_pin(const PinMsg& m) {
     } else if (resp.reason == Reason::Revoked) {
         ui_show_denied("Access denied", "This PIN has been revoked");
     } else {
-        ui_show_denied("Access denied", "PIN not recognised");
+        ui_show_denied("Access denied", face_pin ? "Face and PIN did not match" : "PIN not recognised");
     }
-    send_photo(ctr, jpg, jpg_len);
+    if (face_pin) {
+        free(jpg);  // the face image already sent becomes this event's photo
+    } else {
+        send_photo(ctr, jpg, jpg_len);
+    }
 }
 
 bool heartbeat(bool& lockdown, char* door_name, size_t name_cap, HeartbeatAck& out) {
@@ -472,7 +575,8 @@ void net_task(void*) {
         bool alive = wired && heartbeat(ld, name, sizeof(name), ack);
         if (alive) {
             if (name[0]) ui_set_door_name(name);
-            ui_set_cred_mode(static_cast<uint8_t>(ack.cred_mode));
+            s_cred_mode = static_cast<uint8_t>(ack.cred_mode);
+            ui_set_cred_mode(s_cred_mode);
             run_command(ack.command, ack.command_id);
             if (static_cast<int32_t>(now_ms() - next_diag) >= 0) {
                 send_diag();
@@ -591,6 +695,9 @@ extern "C" void app_main(void) {
         s_tsens = nullptr;
     }
     camera_begin();
+    s_face_ref = esp_random();
+    s_watch_q = xQueueCreate(2, sizeof(WatchReq));
+    xTaskCreate(watch_task, "watch", 6144, nullptr, 4, nullptr);
     xTaskCreate(net_task, "net", 8192, nullptr, 5, nullptr);
     ESP_LOGI(TAG, "door %u ready, waiting for controller on USB", s_cfg.door_id);
     park();

@@ -57,6 +57,20 @@ async def serve(data: Path, host: str, http_port: int, udp_port: int) -> None:
         logging.getLogger("lintel").info("face recognition ready (%s)", models)
     except (FileNotFoundError, ImportError) as e:
         logging.getLogger("lintel").warning("face recognition disabled: %s", e)
+    live = None
+    try:
+        from .liveness import PassiveLiveness
+        live = PassiveLiveness(models)
+        logging.getLogger("lintel").info("face liveness checks ready (%s)", models)
+    except (FileNotFoundError, ImportError) as e:
+        logging.getLogger("lintel").warning("guided face enrolment disabled: %s", e)
+    people = None
+    try:
+        from .tailgate import PersonDetector
+        people = PersonDetector(models)
+        logging.getLogger("lintel").info("tailgating detection ready (%s)", models)
+    except (FileNotFoundError, ImportError) as e:
+        logging.getLogger("lintel").warning("tailgating detection disabled: %s", e)
 
     def face_evidence(ev: dict, jpeg: bytes, door: str, who: str) -> None:
         rel = stamp_photo(store.data_dir / "photos", jpeg, ev["seq"], ev["ts"], door, who)
@@ -64,7 +78,7 @@ async def serve(data: Path, host: str, http_port: int, udp_port: int) -> None:
         hub.publish({"type": "photo", "seq": ev["seq"]})
 
     ctl.on_face_evidence = face_evidence
-    app = create_app(store, ctl, hub, udp_port, faces)
+    app = create_app(store, ctl, hub, udp_port, faces, people, live)
     init = data / "initial_admin.txt"
     if init.exists():
         logging.getLogger("lintel").warning("first-run admin credentials are in %s", init)

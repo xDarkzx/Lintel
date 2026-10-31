@@ -54,6 +54,12 @@ or forge a grant.
 - Three wrong PINs lock the keypad (30 s, doubling to 15 min), raise a critical
   alarm and photograph the person; every attempt is photographed
 - Duress PIN: opens normally, silently raises a critical alarm
+- Tailgating detection with no extra camera: after a grant the keypad records
+  the open doorway, and the server counts the people who go through against
+  the credentials used. Counting only, no face processing of bystanders;
+  frames are deleted unless they are evidence for the alarm
+- Face + PIN doors decide on both together; on PIN doors, a clear face that
+  is plainly not the PIN's owner raises a "PIN used by someone else" alarm
 - Screen follows the door's mode (PIN, card, card + PIN, face, face + PIN),
   name and site lockdown, all delivered from the server
 - Fail-secure lock relay output; remote unlock from the console with a reason
@@ -73,7 +79,9 @@ or forge a grant.
 - Diagnostics per keypad: uptime, last reset reason, memory, chip
   temperature, camera, link errors, rejected frames, decision latency,
   remote screenshot, test photo, identify, reboot
-- Face enrolment from entry photos; card enrolment by tapping at a door
+- Guided face enrolment with liveness checks (random head-turn steps and
+  anti-spoofing on every frame, judged on the server); card enrolment by
+  tapping at a door
 - Encrypted backup; alarm webhook to Teams, Slack or a pager
 
 ## Screens

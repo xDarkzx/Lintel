@@ -33,6 +33,11 @@ trusted only for its own door. The server is the only place decisions are made.
 | Door key exposed during setup | Key sealed to the keypad's X25519 public key; never typed, logged or shown | `Adopt.GoldenBlobMatchesServer`, `test_discover_adopt_deliver_and_use` |
 | Rolling a keypad back to an old key | Monotonic adoption sequence | `SealOpenRoundTripAndTamper`, firmware `on_provision` |
 | PIN guessing at the door | 3 failures lock the keypad, doubling to 15 min; P1 alarm with photo | `test_bad_pin_then_lockout_and_alarm` |
+| Tailgating on someone else's entry | After a grant the keypad records the open door; more people than credentials, near the door, in two or more frames raises a P2 alarm with an outlined evidence photo | `test_tailgate.py` |
+| Faking or hiding door frames | Each frame is signed by the keypad with its index, burst length and capture time; a relaying controller cannot add, drop or reorder frames, and missing frames are reported | `test_frames_are_signed_ordered_and_bound_to_a_grant`, `test_missing_frames_are_analysed_after_the_timeout` |
+| Enrolling a photo, screen or video as someone's face | Guided enrolment judged on the server: anti-spoofing models on every frame, head-turn steps in a random order, the same face throughout; templates only when every step passes | `test_enrolment.py` |
+| A shared or stolen PIN | On PIN doors, a clear face unlike every face enrolled for that PIN raises a P3 alarm; face + PIN doors refuse it outright | `test_someone_else_using_a_pin_raises_an_alarm`, `test_face_and_pin_door_needs_the_pin_owners_face` |
+| Bypassing a door's credential mode | Every request, including a bare PIN, is checked against what the door accepts | `test_a_bare_pin_respects_the_doors_mode` |
 | Coercion | Duress PIN grants normally and raises a silent P1 alarm | `test_duress_grants_silently_but_raises_critical_alarm` |
 | Stolen database | PINs and card UIDs stored as HMAC tags keyed outside the database | `test_backup_restores_a_working_site` |
 | Editing history | HMAC-SHA256 hash chain; photo hashes are chained too | `test_journal_detects_tampering`, `Audit.*` |
@@ -51,6 +56,15 @@ trusted only for its own door. The server is the only place decisions are made.
 
 - **Single-camera face recognition can be fooled by a good photo.** Face-only
   doors are labelled a convenience tier; face + PIN is the secure tier.
+- **Enrolment liveness is not certified.** The anti-spoofing models
+  (Minivision Silent-Face) and random head-turn steps stop printed photos,
+  screens and most replayed videos; they have not been tested by an
+  ISO/IEC 30107-3 lab, and a good 3D mask could pass.
+- **A keypad camera can miss a tailgater hidden directly behind the first
+  person**, as can any reader-mounted camera. An overhead camera covers that
+  case. Tailgating detection counts people with a general person detector
+  (YOLOX-S); it does not identify them, so it is not biometric processing of
+  bystanders under the NZ Biometric Processing Privacy Code.
 - **RC522 cards are read by UID**, which inexpensive cards let an attacker
   clone. Use card + PIN, or NTAG 424 DNA cards with a PN532 reader (supported
   in `lintel_core/sdm`), where each tap is cryptographically fresh.

@@ -153,7 +153,9 @@ void reset_entry() {
     std::memset(s_pin, 0, sizeof(s_pin));
     s_len = 0;
     s_busy = false;
-    lv_label_set_text(s_prompt, s_lockdown ? "Security PIN required" : "Enter your PIN");
+    lv_label_set_text(s_prompt, s_lockdown    ? "Security PIN required"
+                                : s_mode == 5 ? "Look at the camera, enter your PIN"
+                                              : "Enter your PIN");
     lv_obj_set_style_text_color(s_prompt, lv_color_hex(s_lockdown ? kRed : kMuted), 0);
     render_dots();
 }
