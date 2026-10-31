@@ -502,7 +502,7 @@ void handle_pin(const PinMsg& m) {
     if (!ok) {
         ESP_LOGW(TAG, "no valid reply from server");
         free(jpg);  // no event on the server to attach it to
-        ui_show_denied("No answer", "Controller or server unreachable.\nDoor stays locked.");
+        ui_show_denied("Access denied", "Server could not be reached.\nDoor stays locked.");
         return;
     }
     s_last_decision_ms = now_ms() - t0;
@@ -525,15 +525,15 @@ void handle_pin(const PinMsg& m) {
     } else if (resp.reason == Reason::Revoked) {
         ui_show_denied("Access denied", "This PIN has been revoked");
     } else if (resp.reason == Reason::NoFace) {
-        ui_show_denied("Face not seen", "Look straight at the camera,\nthen enter your PIN again.");
+        ui_show_denied("Access denied", "No face detected.\nLook at the camera and try again.");
     } else if (resp.reason == Reason::FaceNotEnrolled) {
-        ui_show_denied("Face not enrolled", "This door needs your face and PIN.\nAsk your administrator to enrol your face.");
+        ui_show_denied("Access denied", "Account not verified:\nno face enrolled for this PIN.");
     } else if (resp.reason == Reason::NoMatch) {
-        ui_show_denied("Face not recognised", "Your face did not match\nthe faces enrolled for this PIN.");
+        ui_show_denied("Access denied", "Face does not match\nthis account.");
     } else if (resp.reason == Reason::Mismatch) {
-        ui_show_denied("Access denied", "Face and PIN belong to\ndifferent people.");
+        ui_show_denied("Access denied", "Face belongs to a\ndifferent account.");
     } else if (resp.reason == Reason::WrongMode) {
-        ui_show_denied("Not accepted here", face_pin ? "This door needs your face and PIN." : "This door does not accept a PIN.");
+        ui_show_denied("Access denied", face_pin ? "This door needs your face and PIN." : "This door does not accept a PIN.");
     } else if (resp.reason == Reason::DoorNotAllowed) {
         ui_show_denied("Access denied", "You do not have access to this door");
     } else {
