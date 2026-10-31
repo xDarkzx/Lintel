@@ -11,6 +11,7 @@ from pathlib import Path
 import uvicorn
 
 from .access import AccessEngine
+from .photos import stamp_photo
 from .controller import Controller, run_controller
 from .store import Store
 from .web import Hub, create_app
@@ -21,7 +22,22 @@ async def serve(data: Path, host: str, http_port: int, udp_port: int) -> None:
     hub = Hub()
     ctl = Controller(store, AccessEngine(store), hub.publish)
     ctl.load_doors()
-    app = create_app(store, ctl, hub, udp_port)
+    faces = None
+    models = Path(os.environ.get("LINTEL_MODELS", Path(__file__).resolve().parent.parent / "models"))
+    try:
+        from .faces import FaceEngine
+        faces = FaceEngine(models)
+        logging.getLogger("lintel").info("face recognition ready (%s)", models)
+    except (FileNotFoundError, ImportError) as e:
+        logging.getLogger("lintel").warning("face recognition disabled: %s", e)
+
+    def face_evidence(ev: dict, jpeg: bytes, door: str, who: str) -> None:
+        rel = stamp_photo(store.data_dir / "photos", jpeg, ev["seq"], ev["ts"], door, who)
+        store.x("UPDATE events SET photo=? WHERE seq=?", (rel, ev["seq"]))
+        hub.publish({"type": "photo", "seq": ev["seq"]})
+
+    ctl.on_face_evidence = face_evidence
+    app = create_app(store, ctl, hub, udp_port, faces)
     init = data / "initial_admin.txt"
     if init.exists():
         logging.getLogger("lintel").warning("first-run admin credentials are in %s", init)

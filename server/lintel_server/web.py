@@ -151,7 +151,11 @@ class OperatorIn(BaseModel):
     role: str = Field(pattern="^(admin|operator|viewer)$")
 
 
-def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int) -> FastAPI:
+class CardEnrolIn(BaseModel):
+    door_id: int = Field(ge=1, le=31)
+
+
+def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: Any = None) -> FastAPI:
     app = FastAPI(title="Lintel Access Control", docs_url="/api/docs", openapi_url="/api/openapi.json")
     app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
@@ -394,6 +398,8 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int) -> FastAP
         d = dict(r)
         d["has_pin"] = d.pop("pin_tag") is not None
         d["has_duress"] = d.pop("duress_tag") is not None
+        d["has_card"] = d.pop("card_tag", None) is not None
+        d["faces"] = store.q1("SELECT COUNT(*) n FROM face_templates WHERE cardholder_id=?", (d["id"],))["n"]
         d["groups"] = [g["group_id"] for g in store.q("SELECT group_id FROM cardholder_groups WHERE cardholder_id=?",
                                                      (d["id"],))]
         last = store.q1("SELECT ts, door_id FROM events WHERE cardholder_id=? AND kind='access.granted' "
@@ -476,6 +482,107 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int) -> FastAP
         store.x("DELETE FROM cardholders WHERE id=?", (cid,))
         journal(op, "cardholder.deleted", f"{r['first_name']} {r['last_name']} deleted", cardholder_id=cid)
         return {"ok": True}
+
+    # ---- credentials: cards and faces ------------------------------------------------------
+
+    def need_faces() -> Any:
+        if faces is None:
+            raise HTTPException(503, "face recognition is not available: face models are not installed")
+        return faces
+
+    def templates() -> list[tuple[int, Any]]:
+        import numpy as np
+        return [(r["cardholder_id"], np.frombuffer(r["embedding"], dtype=np.float32))
+                for r in store.q("SELECT t.cardholder_id, t.embedding FROM face_templates t "
+                                 "JOIN cardholders c ON c.id = t.cardholder_id WHERE c.active=1")]
+
+    def enrol_face(cid: int, jpeg: bytes, source: str, op: dict) -> dict:
+        from .faces import FaceError
+        if store.q1("SELECT 1 FROM cardholders WHERE id=?", (cid,)) is None:
+            raise HTTPException(404, "no such cardholder")
+        try:
+            r = need_faces().analyse(jpeg)
+        except FaceError as e:
+            raise HTTPException(400, str(e))
+        # Refuse a face that already matches someone else: one face, one identity.
+        other, score = need_faces().best_match(r.embedding, [t for t in templates() if t[0] != cid])
+        if other is not None:
+            raise HTTPException(409, f"this face already matches another cardholder ({score:.2f})")
+        store.x("INSERT INTO face_templates(cardholder_id, embedding, source, created) VALUES(?, ?, ?, ?)",
+                (cid, r.embedding.tobytes(), source, time.time()))
+        journal(op, "cardholder.face_enrolled", f"face template added from {source}", cardholder_id=cid)
+        n = store.q1("SELECT COUNT(*) n FROM face_templates WHERE cardholder_id=?", (cid,))["n"]
+        return {"ok": True, "faces": n, "detect_score": round(r.detect_score, 3)}
+
+    @app.post("/api/cardholders/{cid}/faces")
+    async def add_face(cid: int, request: Request, op: dict = Depends(admin)) -> dict:
+        body = await request.body()
+        if not 0 < len(body) <= 8_000_000:
+            raise HTTPException(413, "image too large")
+        return enrol_face(cid, body, "upload", op)
+
+    @app.post("/api/cardholders/{cid}/faces/from-event/{seq}")
+    def add_face_from_event(cid: int, seq: int, op: dict = Depends(admin)) -> dict:
+        r = store.q1("SELECT photo FROM events WHERE seq=?", (seq,))
+        if r is None or not r["photo"]:
+            raise HTTPException(404, "that event has no photo")
+        return enrol_face(cid, (store.data_dir / "photos" / r["photo"]).read_bytes(), f"event #{seq}", op)
+
+    @app.delete("/api/cardholders/{cid}/faces")
+    def clear_faces(cid: int, op: dict = Depends(admin)) -> dict:
+        store.x("DELETE FROM face_templates WHERE cardholder_id=?", (cid,))
+        journal(op, "cardholder.face_removed", "all face templates removed", cardholder_id=cid)
+        return {"ok": True}
+
+    @app.get("/api/cardholders/{cid}/photos")
+    def cardholder_photos(cid: int, op: dict = Depends(viewer)) -> list[dict]:
+        """Recent entry photos of this person, to enrol a face from."""
+        return [dict(r) for r in store.q(
+            "SELECT seq, ts, door_id FROM events WHERE cardholder_id=? AND photo IS NOT NULL "
+            "ORDER BY seq DESC LIMIT 12", (cid,))]
+
+    @app.post("/api/cardholders/{cid}/card/enrol")
+    def enrol_card(cid: int, body: CardEnrolIn, op: dict = Depends(admin)) -> dict:
+        if store.q1("SELECT 1 FROM cardholders WHERE id=?", (cid,)) is None:
+            raise HTTPException(404, "no such cardholder")
+        ctl.engine.start_card_enrolment(body.door_id, cid)
+        journal(op, "cardholder.card_enrolment", f"waiting for a card at door {body.door_id}",
+                cardholder_id=cid, door_id=body.door_id)
+        return {"ok": True, "expires_in": 60}
+
+    @app.delete("/api/cardholders/{cid}/card")
+    def remove_card(cid: int, op: dict = Depends(admin)) -> dict:
+        store.x("UPDATE cardholders SET card_tag=NULL WHERE id=?", (cid,))
+        journal(op, "cardholder.card_removed", "card removed", cardholder_id=cid)
+        return {"ok": True}
+
+    @app.post("/api/door/{door_id}/face")
+    async def door_face(door_id: int, request: Request) -> dict:
+        """A panel's face scan, relayed by its controller and signed like photos.
+        The result is held for the CredReq that follows; the controller learns
+        only whether a face was usable, never who it was."""
+        from .faces import FaceError
+        link = ctl.doors.get(door_id)
+        if link is None:
+            raise HTTPException(404, "unknown door")
+        body = await request.body()
+        try:
+            ref = int(request.headers["x-lintel-req"])
+            mac = bytes.fromhex(request.headers["x-lintel-mac"])
+        except (KeyError, ValueError):
+            raise HTTPException(400, "missing signature")
+        want = hmac.new(photo_key(link.key), f"face:{door_id}:{ref}:".encode() + hashlib.sha256(body).digest(),
+                        hashlib.sha256).digest()
+        if not hmac.compare_digest(mac, want) or ref == 0:
+            raise HTTPException(403, "bad signature")
+        try:
+            r = need_faces().analyse(body)
+        except FaceError as e:
+            ctl.face_results[(door_id, ref)] = (None, 0.0, time.time(), body, str(e))
+            return {"ok": True, "face": False, "why": str(e)}
+        cid, score = need_faces().best_match(r.embedding, templates())
+        ctl.face_results[(door_id, ref)] = (cid, score, time.time(), body, None)
+        return {"ok": True, "face": True}
 
     # ---- events, reports, journal ----------------------------------------------------------
 
