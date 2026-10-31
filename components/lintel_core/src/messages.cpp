@@ -117,7 +117,7 @@ bool decode(const uint8_t* p, size_t len, HeartbeatAck& m) {
     m.cred_mode = static_cast<CredMode>(p[11]);
     std::memcpy(m.door_name, p + 12, sizeof(m.door_name));
     m.door_name[sizeof(m.door_name) - 1] = 0;
-    if (p[36] > static_cast<uint8_t>(PanelCommand::TestPhoto)) return false;
+    if (p[36] > static_cast<uint8_t>(PanelCommand::Unlock)) return false;
     m.command = static_cast<PanelCommand>(p[36]);
     m.command_id = get_u32(p + 37);
     return true;

@@ -2,3 +2,4 @@ data/
 .pytest_cache/
 models/
 panel_media/
+.venv/

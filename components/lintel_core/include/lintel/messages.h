@@ -95,6 +95,7 @@ enum class PanelCommand : uint8_t {
     Identify = 2,    // flash the screen so a technician can find this panel
     Screenshot = 3,  // send a capture of the screen
     TestPhoto = 4,   // send a camera frame
+    Unlock = 5,      // release the door once, from the security desk
 };
 
 struct HeartbeatAck {

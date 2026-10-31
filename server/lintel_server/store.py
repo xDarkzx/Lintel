@@ -333,4 +333,7 @@ class Store:
                     event_seq: int | None = None) -> dict[str, Any]:
         aid = self.x("INSERT INTO alarms(ts, event_seq, priority, kind, title, door_id) VALUES(?, ?, ?, ?, ?, ?)",
                      (time.time(), event_seq, priority, kind, title, door_id))
-        return dict(self.q1("SELECT * FROM alarms WHERE id=?", (aid,)))
+        alarm = dict(self.q1("SELECT * FROM alarms WHERE id=?", (aid,)))
+        from . import notify
+        notify.send_async(self, alarm)
+        return alarm

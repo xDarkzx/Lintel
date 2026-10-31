@@ -217,7 +217,7 @@ class HeartbeatAck:
                 + struct.pack("<BI", self.command, self.command_id))
 
 
-COMMANDS = {"reboot": 1, "identify": 2, "screenshot": 3, "test_photo": 4}
+COMMANDS = {"reboot": 1, "identify": 2, "screenshot": 3, "test_photo": 4, "unlock": 5}
 RESET_REASONS = {0: "unknown", 1: "power-on", 2: "external pin", 3: "software restart", 4: "crash (panic)",
                  5: "interrupt watchdog", 6: "task watchdog", 7: "other watchdog", 8: "deep sleep", 9: "brownout",
                  10: "SDIO", 11: "USB", 12: "JTAG", 13: "eFuse", 14: "power glitch", 15: "CPU lockup"}

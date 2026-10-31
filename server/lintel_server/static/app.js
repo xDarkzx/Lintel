@@ -257,6 +257,7 @@ function eventInfo(e) {
   if (k === "link.rejected") return ["bad", "shield-lock", "Rejected traffic"];
   if (k === "site.mode") return ["violet", "broadcast", "Site mode"];
   if (k === "photo.attached") return ["", "photo", "Photo stored"];
+  if (k === "door.remote_unlock") return ["warn", "lock-access", "Remote unlock"];
   if (k.startsWith("device.")) return ["info", "cpu", "Device " + k.split(".")[1].replace(/_/g, " ")];
   if (k.startsWith("alarm.")) return ["warn", "bell", "Alarm " + k.split(".")[1]];
   if (k.startsWith("operator.")) return ["", "user-shield", "Operator " + k.split(".")[1].replace(/_/g, " ")];
@@ -406,7 +407,7 @@ const credIcons = (c) => `<div class="creds">
   <span class="cred duress ${c.has_duress ? "on" : ""}" title="Duress PIN">${icon("alert-triangle")}</span></div>`;
 PAGES.cardholders = async (el) => {
   el.innerHTML = head("Cardholders", "People, their credentials and where they can go",
-    isAdmin() ? `<button id="add" class="btn primary">${icon("plus")}New cardholder</button>` : "")
+    isAdmin() ? `<label class="btn">${icon("download")}Import CSV<input type="file" id="import" accept=".csv,text/csv" class="hidden"></label><button id="add" class="btn primary">${icon("plus")}New cardholder</button>` : "")
     + `<div class="card"><div class="card-head" style="justify-content:flex-start"><input id="q" placeholder="Filter by name, department or email" style="max-width:340px"><span id="count" class="muted"></span></div>
       <div class="table-wrap"><table><thead><tr><th>Name</th><th>Department</th><th>Credentials</th><th>Access groups</th><th>Status</th><th>Last access</th></tr></thead><tbody id="rows"></tbody></table></div></div>`;
   const groups = await api("/api/groups");
@@ -427,6 +428,17 @@ PAGES.cardholders = async (el) => {
   };
   $("#q").addEventListener("input", () => { clearTimeout(load.t); load.t = setTimeout(load, 180); });
   $("#add")?.addEventListener("click", () => cardholderPanel(null));
+  $("#import")?.addEventListener("change", async (e) => {
+    const file = e.target.files[0]; if (!file) return;
+    try {
+      const r = await api("/api/cardholders/import", { body: file, headers: { "Content-Type": "text/csv" } });
+      await dialog({ title: `Imported ${r.added} cardholder${r.added === 1 ? "" : "s"}`, ic: "users", cancel: null, confirm: "Done",
+        text: (r.issues.length ? `<b>${r.issues.length} line${r.issues.length > 1 ? "s" : ""} need attention:</b><br>${r.issues.map(esc).join("<br>")}<br><br>` : "")
+          + "Columns: first_name, last_name, department, email, groups (separated by ;). PINs are never imported; set them per person." });
+      load();
+    } catch (err) { fail(err); }
+    e.target.value = "";
+  });
   await load();
 };
 const toDateInput = (ts) => ts ? new Date(ts * 1000).toISOString().slice(0, 10) : "";
@@ -706,12 +718,21 @@ async function doorPanel(id) {
         <div class="card stat"><div><div class="label">Granted today</div><div class="value">${today("access.granted")}</div></div></div>
         <div class="card stat"><div><div class="label">Denied today</div><div class="value">${today("access.denied")}</div></div></div>
         <div class="card stat"><div><div class="label">Rejected frames</div><div class="value">${d.rejects}</div></div></div></div>
+      ${canOperate() && d.serial ? `<div class="actions" style="margin:6px 0 4px"><button class="btn" id="unlock">${icon("lock-access")}Unlock door now</button>
+        <span class="muted" style="font-size:12.5px">Releases the door once, as if a valid credential was used. Requires a reason; recorded against you.</span></div>` : ""}
       <div class="section">Device</div>
       ${d.serial ? `<div class="kvs">${kv("Serial", `<span class="mono">${esc(d.serial)}</span>`)}${kv("MAC address", `<span class="mono">${esc(d.mac)}</span>`)}${kv("Firmware", esc(d.firmware))}${kv("Door controller", esc(d.controller))}${kv("Adopted", d.adopted_at ? fmtDate(d.adopted_at) : "—")}${kv("Last seen", ago(d.last_seen))}</div>`
         : emptyState("cpu", "No device", "Adopt a keypad into this door from Doors & devices.")}
       <div class="section">Access</div>
       <div class="kvs">${kv("Credentials accepted", MODE_LABEL[d.credential_mode] || "PIN")}${kv("Unlock time", `${d.unlock_ms / 1000} s`)}</div>
       <p class="muted" style="font-size:12.5px">${d.groups.length ? `Open to: ${d.groups.map((g) => `${esc(g.name)} (${esc(g.schedule)})`).join(", ")}` : "No access group includes this door yet."}</p>`;
+    $("#unlock")?.addEventListener("click", async () => {
+      const reason = await dialog({ title: `Unlock ${d.name} now?`, tone: "warn", ic: "lock-access", confirm: "Unlock",
+        text: "The door releases for its normal unlock time. Say why; the reason is stored in the audit trail.", input: { label: "Reason", placeholder: "e.g. courier at loading bay" } });
+      if (reason === null) return;
+      if (!reason.trim()) return toast("A reason is required", "bad");
+      try { await api(`/api/doors/${id}/command`, { body: { command: "unlock", reason } }); toast(`${d.name} released`); } catch (err) { fail(err); }
+    });
   };
   const settings = () => {
     const inGroup = new Set(d.groups.map((g) => g.id));
@@ -793,7 +814,7 @@ PAGES.operators = async (el) => {
       <td><span class="badge ${o.role === "admin" ? "violet" : o.role === "operator" ? "accent" : ""}">${o.role}</span></td>
       <td>${o.mfa ? `<span class="badge ok">${icon("shield-check")}On</span>` : `<span class="badge warn">Off</span>`}</td>
       <td class="muted">${ago(o.last_login)}</td><td class="muted">${fmtDay(o.created)}</td>
-      <td style="text-align:right">${o.username === ME.username ? `<span class="muted">You</span>` : `<button class="btn sm danger" data-del="${o.id}">Remove</button>`}</td></tr>`).join("")}</tbody></table></div></div>`;
+      <td style="text-align:right;white-space:nowrap">${o.active ? "" : `<span class="badge bad">Disabled</span> `}<button class="btn sm" data-edit="${o.id}">Manage</button></td></tr>`).join("")}</tbody></table></div></div>`;
   $("#add").addEventListener("click", () => {
     openPanel(panelShell({ title: "New operator", sub: "Ask them to turn on two-factor sign-in at first login" }));
     $("#panel-content").innerHTML = `<form id="of" class="stack"><label class="field"><span>Username</span><input name="username" required minlength="3" autocomplete="off"></label>
@@ -805,8 +826,29 @@ PAGES.operators = async (el) => {
       try { await api("/api/operators", { body: Object.fromEntries(new FormData(e.target)) }); closePanel(); render(); } catch (err) { fail(err); }
     });
   });
-  $$("[data-del]").forEach((b) => b.addEventListener("click", async () => {
-    if (await dialog({ title: "Remove this operator?", tone: "bad", ic: "trash", danger: true, confirm: "Remove", text: "They are signed out and can no longer use the console." })) { await api(`/api/operators/${b.dataset.del}`, { method: "DELETE" }); render(); }
+  $$("[data-edit]").forEach((b) => b.addEventListener("click", () => {
+    const o = ops.find((x) => x.id == b.dataset.edit);
+    const self = o.username === ME.username;
+    openPanel(panelShell({ avatar: `<span class="avatar lg">${initials(o.username)}</span>`, title: esc(o.username), sub: `${o.role} · last sign-in ${ago(o.last_login)}` }));
+    $("#panel-content").innerHTML = `<form id="oe" class="stack">
+      <label class="field"><span>Role</span><select name="role">${["viewer", "operator", "admin"].map((r) => `<option ${o.role === r ? "selected" : ""}>${r}</option>`).join("")}</select></label>
+      <label class="chk" style="align-self:flex-start"><input type="checkbox" name="active" ${o.active ? "checked" : ""} ${self ? "disabled" : ""}>Account enabled</label>
+      <label class="field"><span>Reset password</span><input name="password" type="password" minlength="12" autocomplete="new-password" placeholder="Leave empty to keep"><small>At least 12 characters</small></label>
+      ${o.mfa ? `<label class="chk" style="align-self:flex-start"><input type="checkbox" name="reset_mfa">Reset two-factor (lost phone)</label>` : ""}
+      <p class="muted" style="font-size:12.5px;margin:0">Any change signs this operator out everywhere. The last admin cannot be demoted or disabled.</p>
+      <div class="actions" style="justify-content:space-between">${self ? "<span></span>" : `<button type="button" id="del" class="btn danger">${icon("trash")}Delete operator</button>`}<button class="btn primary">Save</button></div></form>`;
+    $("#oe").addEventListener("submit", async (e) => {
+      e.preventDefault(); const f = new FormData(e.target);
+      const body = { role: f.get("role"), reset_mfa: f.has("reset_mfa") };
+      if (!self) body.active = f.has("active");
+      if (f.get("password")) body.password = f.get("password");
+      try { await api(`/api/operators/${o.id}`, { method: "PATCH", body }); toast("Operator updated"); closePanel(); render(); } catch (err) { fail(err); }
+    });
+    $("#del")?.addEventListener("click", async () => {
+      if (await dialog({ title: `Delete ${o.username}?`, tone: "bad", ic: "trash", danger: true, confirm: "Delete", text: "They are signed out and can no longer use the console. Their past actions stay in the audit trail." })) {
+        try { await api(`/api/operators/${o.id}`, { method: "DELETE" }); closePanel(); render(); } catch (err) { fail(err); }
+      }
+    });
   }));
 };
 
@@ -828,8 +870,22 @@ PAGES.settings = async (el) => {
         <div class="kvs">${kv("Server certificate (SHA-256)", s.tls_fingerprint ? `<span class="mono">${s.tls_fingerprint.match(/.{1,16}/g).join(" ")}</span>` : "HTTPS not active")}
           ${kv("Door controller token", `<span class="mono">${esc(s.controller_token_hint)}</span>`)}</div>
         <p class="muted" style="margin:0;font-size:12.5px">Door controllers pin this certificate and present the controller token on every call. Both are written to <span class="mono">controller.env</span> in the server's data folder for installing on a controller.</p>
-      </div></div></div>`;
+      </div></div>
+      ${isAdmin() ? `<div class="card"><div class="card-head"><h2>Alarm notifications</h2></div><div class="card-body"><form id="wh" class="stack">
+        <label class="field"><span>Webhook URL (HTTPS)</span><input name="url" placeholder="https://… (Teams, Slack, pager gateway)"><small>Alarms are posted as JSON with a plain-text summary in <span class="mono">text</span>.</small></label>
+        <label class="field"><span>Send alarms of priority</span><select name="min_priority"><option value="1">P1 only (critical)</option><option value="2">P1 and P2</option><option value="3">P1 to P3</option><option value="4">All</option></select></label>
+        <div class="actions" style="justify-content:flex-end"><button type="button" id="wh-test" class="btn">Send test</button><button class="btn primary">Save</button></div></form></div></div>` : ""}
+      </div>`;
   if (ro) $$("#sf input").forEach((i) => (i.disabled = true));
+  if (isAdmin()) {
+    const w = await api("/api/settings/webhook");
+    $("#wh [name=url]").value = w.url; $("#wh [name=min_priority]").value = String(w.min_priority);
+    $("#wh").addEventListener("submit", async (e) => {
+      e.preventDefault(); const f = new FormData(e.target);
+      try { await api("/api/settings/webhook", { method: "PUT", body: { url: f.get("url").trim(), min_priority: Number(f.get("min_priority")) } }); toast("Notifications saved"); } catch (err) { fail(err); }
+    });
+    $("#wh-test").addEventListener("click", async () => { try { await api("/api/settings/webhook/test", { method: "POST" }); toast("Test alarm delivered"); } catch (err) { fail(err); } });
+  }
   $("#sf").addEventListener("submit", async (e) => {
     e.preventDefault(); const f = new FormData(e.target);
     try {

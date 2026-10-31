@@ -11,3 +11,10 @@ services:
       - ./data:/data
     environment:
       TZ: Pacific/Auckland
+    # Least privilege: nothing writable but /data, no capabilities, no setuid.
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true

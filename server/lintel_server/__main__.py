@@ -74,7 +74,7 @@ async def serve(data: Path, host: str, http_port: int, udp_port: int) -> None:
     (data / "controller.env").write_text(f"LINTEL_TOKEN={store.secrets.controller_token}\n"
                                          f"LINTEL_PIN_SHA256={fp}\n")
     logging.getLogger("lintel").info("HTTPS certificate SHA-256 %s", fp)
-    server = uvicorn.Server(uvicorn.Config(app, host=host, port=http_port, log_level="info",
+    server = uvicorn.Server(uvicorn.Config(app, host=host, port=http_port, log_level="info", server_header=False,
                                            ssl_certfile=str(cert), ssl_keyfile=str(key)))
     await asyncio.gather(server.serve(), run_controller(ctl, host, udp_port), maintenance(store, app))
 

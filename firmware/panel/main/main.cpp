@@ -279,6 +279,10 @@ void run_command(PanelCommand cmd, uint32_t id) {
         case PanelCommand::Identify:
             ui_identify(8000);
             break;
+        case PanelCommand::Unlock:
+            ESP_LOGW(TAG, "door released remotely");
+            ui_show_granted("Door unlocked", "Released by the security desk", 5000);
+            break;
         case PanelCommand::Screenshot: {
             uint32_t w = 0, h = 0;
             size_t len = 0;

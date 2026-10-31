@@ -597,7 +597,7 @@ void ui_begin(const char* door_name, SubmitFn on_submit, void* ctx) {
     lv_obj_set_style_bg_grad_color(scr, lv_color_hex(kBg), 0);
     lv_obj_set_style_bg_grad_dir(scr, LV_GRAD_DIR_VER, 0);
     lv_obj_set_style_bg_main_stop(scr, 0, 0);
-    lv_obj_set_style_bg_grad_stop(scr, 120, 0);
+    lv_obj_set_style_bg_grad_stop(scr, 255, 0);  // fade over the full height, no visible band
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
 
     build_header(scr, door_name);

@@ -20,7 +20,7 @@ from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import adopt
+from . import adopt, notify
 from .controller import Controller, photo_key
 from .photos import stamp_photo
 from .protocol import COMMANDS, SiteMode
@@ -30,6 +30,16 @@ from .store import Store, check_password, hash_password
 STATIC = Path(__file__).parent / "static"
 SESSION_S = 12 * 3600
 IDLE_S = 30 * 60
+COOKIE = "__Host-lintel_session"  # HTTPS only, host-locked, path=/
+MAX_IMAGE_PIXELS = 24_000_000
+DUMMY_HASH = hash_password("not-a-real-password")  # equalises sign-in timing for unknown users
+
+
+def csv_safe(v: Any) -> Any:
+    """Neutralise spreadsheet formulas in exported cells (CSV injection)."""
+    if isinstance(v, str) and v[:1] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + v
+    return v
 ROLES = {"viewer": 0, "operator": 1, "admin": 2}
 
 
@@ -153,7 +163,8 @@ class AdoptIn(BaseModel):
 
 
 class CommandIn(BaseModel):
-    command: str = Field(pattern="^(reboot|identify|screenshot|test_photo)$")
+    command: str = Field(pattern="^(reboot|identify|screenshot|test_photo|unlock)$")
+    reason: str = Field("", max_length=200)
 
 
 class AlarmAction(BaseModel):
@@ -165,9 +176,21 @@ class ModeIn(BaseModel):
 
 
 class OperatorIn(BaseModel):
-    username: str = Field(min_length=3, max_length=32)
-    password: str = Field(min_length=10)
+    username: str = Field(min_length=3, max_length=32, pattern=r"^[A-Za-z0-9._-]+$")
+    password: str = Field(min_length=12, max_length=200)
     role: str = Field(pattern="^(admin|operator|viewer)$")
+
+
+class OperatorPatch(BaseModel):
+    role: str | None = Field(None, pattern="^(admin|operator|viewer)$")
+    active: bool | None = None
+    password: str | None = Field(None, min_length=12, max_length=200)
+    reset_mfa: bool = False
+
+
+class WebhookIn(BaseModel):
+    url: str = Field("", max_length=500, pattern=r"^(https://\S+)?$")
+    min_priority: int = Field(1, ge=1, le=4)
 
 
 class CardEnrolIn(BaseModel):
@@ -175,12 +198,22 @@ class CardEnrolIn(BaseModel):
 
 
 def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: Any = None) -> FastAPI:
-    app = FastAPI(title="Lintel Access Control", docs_url="/api/docs", openapi_url="/api/openapi.json")
+    import os
+    docs = os.environ.get("LINTEL_API_DOCS") == "1"  # the API map is only published when asked for
+    app = FastAPI(title="Lintel Access Control", docs_url="/api/docs" if docs else None, redoc_url=None,
+                  openapi_url="/api/openapi.json" if docs else None)
     app.mount("/static", StaticFiles(directory=STATIC), name="static")
     throttle = LoginThrottle()
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next):
+        # Cross-site request defence in depth (cookies are SameSite=Strict too):
+        # a state-changing call carrying an Origin must come from this host.
+        if request.method not in ("GET", "HEAD", "OPTIONS"):
+            origin = request.headers.get("origin")
+            if origin and origin.split("://", 1)[-1] != request.headers.get("host", ""):
+                return Response('{"detail":"cross-origin request refused"}', status_code=403,
+                                media_type="application/json")
         response = await call_next(request)
         for k, v in SECURITY_HEADERS.items():
             if k == "Content-Security-Policy" and request.url.path.startswith("/api/docs"):
@@ -213,9 +246,12 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
         store.x("UPDATE sessions SET last_seen=? WHERE token_hash=?", (now, th))
         return dict(r)
 
+    def session_token(request: Request) -> str | None:
+        return request.cookies.get(COOKIE) or request.cookies.get("lintel_session")
+
     def need(role: str):
         def dep(request: Request) -> dict:
-            op = operator_from_token(request.cookies.get("lintel_session"))
+            op = operator_from_token(session_token(request))
             if op is None:
                 raise HTTPException(401, "not signed in")
             if ROLES[op["role"]] < ROLES[role]:
@@ -237,7 +273,8 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
         if wait:
             raise HTTPException(429, f"too many failed sign-ins; try again in {wait // 60 + 1} min")
         r = store.q1("SELECT * FROM operators WHERE username=? AND active=1", (body.username,))
-        ok = r is not None and check_password(body.password, r["pw_hash"])
+        # Always run one scrypt so a missing account is not faster than a wrong password.
+        ok = check_password(body.password, r["pw_hash"] if r is not None else DUMMY_HASH) and r is not None
         if ok and r["totp_secret"]:
             if not body.code:
                 return {"mfa_required": True}
@@ -260,8 +297,11 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
         store.x("INSERT INTO sessions(token_hash, operator_id, expires, last_seen) VALUES(?, ?, ?, ?)",
                 (hashlib.sha256(token.encode()).hexdigest(), r["id"], now + SESSION_S, now))
         store.x("UPDATE operators SET last_login=? WHERE id=?", (now, r["id"]))
-        response.set_cookie("lintel_session", token, httponly=True, samesite="strict", max_age=SESSION_S,
-                            secure=request.url.scheme == "https")
+        if request.url.scheme == "https":
+            response.set_cookie(COOKIE, token, httponly=True, samesite="strict", max_age=SESSION_S, secure=True,
+                                path="/")
+        else:  # local development and tests only; production serves HTTPS exclusively
+            response.set_cookie("lintel_session", token, httponly=True, samesite="strict", max_age=SESSION_S)
         journal(dict(r), "operator.login", f"signed in from {ip}" + (" with 2FA" if r["totp_secret"] else ""))
         nudge = r["role"] == "admin" and not r["totp_secret"] and store.setting("require_admin_mfa") == "1"
         return {"username": r["username"], "role": r["role"], "mfa_setup_required": nudge}
@@ -311,6 +351,27 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
         journal(op, "operator.password_changed", "password changed; other sessions signed out")
         return {"ok": True}
 
+    @app.get("/api/settings/webhook")
+    def get_webhook(op: dict = Depends(admin)) -> dict:
+        return {"url": store.setting("alarm_webhook"), "min_priority": int(store.setting("alarm_webhook_priority", "1"))}
+
+    @app.put("/api/settings/webhook")
+    def put_webhook(body: WebhookIn, op: dict = Depends(admin)) -> dict:
+        store.set_setting("alarm_webhook", body.url)
+        store.set_setting("alarm_webhook_priority", str(body.min_priority))
+        journal(op, "settings.updated", "alarm webhook " + ("set" if body.url else "cleared"))
+        return {"ok": True}
+
+    @app.post("/api/settings/webhook/test")
+    def test_webhook(op: dict = Depends(admin)) -> dict:
+        if not store.setting("alarm_webhook"):
+            raise HTTPException(400, "no webhook configured")
+        ok, detail = notify.send(store, {"priority": 3, "title": "Test alarm from Lintel", "kind": "test",
+                                         "door": None, "time": time.time()}, force=True)
+        if not ok:
+            raise HTTPException(502, f"webhook failed: {detail}")
+        return {"ok": True}
+
     @app.get("/api/settings")
     def get_settings(op: dict = Depends(viewer)) -> dict:
         return {"site_name": store.setting("site_name"),
@@ -331,9 +392,10 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
 
     @app.post("/api/logout")
     def logout(request: Request, response: Response) -> dict:
-        token = request.cookies.get("lintel_session")
+        token = session_token(request)
         if token:
             store.x("DELETE FROM sessions WHERE token_hash=?", (hashlib.sha256(token.encode()).hexdigest(),))
+        response.delete_cookie(COOKIE, path="/", secure=True)
         response.delete_cookie("lintel_session")
         return {"ok": True}
 
@@ -595,6 +657,35 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
         journal(op, "cardholder.created", f"{body.first_name} {body.last_name} created", cardholder_id=cid)
         return cardholder_out(store.q1("SELECT * FROM cardholders WHERE id=?", (cid,)))
 
+    @app.post("/api/cardholders/import")
+    async def import_cardholders(request: Request, op: dict = Depends(admin)) -> dict:
+        """CSV with a header row: first_name,last_name,department,email,groups
+        (groups separated by ';', matched by name). PINs are never imported:
+        they are set individually so they never sit in a spreadsheet."""
+        raw = (await request.body())[:2_000_000].decode("utf-8-sig", errors="replace")
+        gid = {g["name"].lower(): g["id"] for g in store.q("SELECT id, name FROM access_groups")}
+        added, skipped = 0, []
+        for n, row in enumerate(csv.DictReader(io.StringIO(raw)), start=2):
+            first = (row.get("first_name") or "").strip()
+            if not first:
+                skipped.append(f"line {n}: no first_name")
+                continue
+            groups_ = []
+            for gname in (row.get("groups") or "").split(";"):
+                if gname.strip():
+                    if gname.strip().lower() not in gid:
+                        skipped.append(f"line {n}: unknown group '{gname.strip()}'")
+                        continue
+                    groups_.append(gid[gname.strip().lower()])
+            cid = store.x("INSERT INTO cardholders(first_name, last_name, department, email, created) "
+                          "VALUES(?, ?, ?, ?, ?)", (first[:40], (row.get("last_name") or "").strip()[:40],
+                                                    (row.get("department") or "").strip()[:60],
+                                                    (row.get("email") or "").strip()[:120], time.time()))
+            write_groups(cid, groups_)
+            added += 1
+        journal(op, "cardholder.imported", f"{added} cardholders imported" + (f", {len(skipped)} issues" if skipped else ""))
+        return {"added": added, "issues": skipped[:50]}
+
     @app.patch("/api/cardholders/{cid}")
     def patch_cardholder(cid: int, body: CardholderPatch, op: dict = Depends(admin)) -> dict:
         if store.q1("SELECT 1 FROM cardholders WHERE id=?", (cid,)) is None:
@@ -633,6 +724,18 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
 
     # ---- credentials: cards and faces ------------------------------------------------------
 
+    def check_image(data: bytes) -> None:
+        """Reject decompression bombs before any decoder allocates for them."""
+        from PIL import Image, UnidentifiedImageError
+        try:
+            with Image.open(io.BytesIO(data)) as im:
+                if im.width * im.height > MAX_IMAGE_PIXELS:
+                    raise HTTPException(413, "image dimensions too large")
+                if im.format not in ("JPEG", "PNG"):
+                    raise HTTPException(415, "JPEG or PNG only")
+        except (UnidentifiedImageError, OSError):
+            raise HTTPException(400, "not a readable image")
+
     def need_faces() -> Any:
         if faces is None:
             raise HTTPException(503, "face recognition is not available: face models are not installed")
@@ -648,6 +751,7 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
         from .faces import FaceError
         if store.q1("SELECT 1 FROM cardholders WHERE id=?", (cid,)) is None:
             raise HTTPException(404, "no such cardholder")
+        check_image(jpeg)
         try:
             r = need_faces().analyse(jpeg)
         except FaceError as e:
@@ -766,9 +870,10 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
         w.writerow(["seq", "time", "kind", "door", "cardholder", "decision", "reason", "operator", "detail", "photo",
                     "link"])
         for r in rows:
-            w.writerow([r["seq"], datetime.fromtimestamp(r["ts"]).isoformat(timespec="seconds"), r["kind"],
-                        r["door_name"] or "", r["cardholder_name"] or "", r["decision"] or "", r["reason"] or "",
-                        r["operator"] or "", r["detail"], "yes" if r["photo"] else "", r["link"]])
+            w.writerow([csv_safe(x) for x in (
+                r["seq"], datetime.fromtimestamp(r["ts"]).isoformat(timespec="seconds"), r["kind"],
+                r["door_name"] or "", r["cardholder_name"] or "", r["decision"] or "", r["reason"] or "",
+                r["operator"] or "", r["detail"], "yes" if r["photo"] else "", r["link"])])
         journal(op, "report.exported", f"event report exported ({len(rows)} rows)")
         return StreamingResponse(iter([buf.getvalue()]), media_type="text/csv",
                                  headers={"Content-Disposition": "attachment; filename=lintel-events.csv"})
@@ -822,12 +927,49 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
         journal(op, "operator.created", f"operator '{body.username}' ({body.role}) created")
         return {"id": oid}
 
+    def admins_left(excluding: int) -> int:
+        return store.q1("SELECT COUNT(*) n FROM operators WHERE role='admin' AND active=1 AND id!=?",
+                        (excluding,))["n"]
+
     @app.delete("/api/operators/{oid}")
     def del_operator(oid: int, op: dict = Depends(admin)) -> dict:
         if oid == op["id"]:
             raise HTTPException(400, "you cannot delete yourself")
+        target = store.q1("SELECT * FROM operators WHERE id=?", (oid,))
+        if target is None:
+            raise HTTPException(404, "no such operator")
+        if target["role"] == "admin" and admins_left(oid) == 0:
+            raise HTTPException(409, "cannot remove the last admin")
         store.x("DELETE FROM operators WHERE id=?", (oid,))
-        journal(op, "operator.deleted", f"operator {oid} deleted")
+        journal(op, "operator.deleted", f"operator '{target['username']}' deleted")
+        return {"ok": True}
+
+    @app.patch("/api/operators/{oid}")
+    def patch_operator(oid: int, body: OperatorPatch, op: dict = Depends(admin)) -> dict:
+        target = store.q1("SELECT * FROM operators WHERE id=?", (oid,))
+        if target is None:
+            raise HTTPException(404, "no such operator")
+        losing_admin = target["role"] == "admin" and (
+            (body.role is not None and body.role != "admin") or body.active is False)
+        if losing_admin and admins_left(oid) == 0:
+            raise HTTPException(409, "cannot demote or disable the last admin")
+        changed = []
+        if body.role is not None and body.role != target["role"]:
+            store.x("UPDATE operators SET role=? WHERE id=?", (body.role, oid))
+            changed.append(f"role {target['role']} -> {body.role}")
+        if body.active is not None and int(body.active) != target["active"]:
+            store.x("UPDATE operators SET active=? WHERE id=?", (int(body.active), oid))
+            changed.append("enabled" if body.active else "disabled")
+        if body.password:
+            store.x("UPDATE operators SET pw_hash=? WHERE id=?", (hash_password(body.password), oid))
+            changed.append("password reset")
+        if body.reset_mfa:
+            store.x("UPDATE operators SET totp_secret=NULL WHERE id=?", (oid,))
+            changed.append("two-factor reset")
+        if changed:
+            # Any change to an account ends its sessions.
+            store.x("DELETE FROM sessions WHERE operator_id=?", (oid,))
+            journal(op, "operator.updated", f"'{target['username']}': {', '.join(changed)}")
         return {"ok": True}
 
     # ---- photos ------------------------------------------------------------------------------------
@@ -842,6 +984,7 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
         body = await request.body()
         if not 0 < len(body) <= 2_000_000:
             raise HTTPException(413, "photo too large")
+        check_image(body)
         try:
             req = int(request.headers["x-lintel-req"])
             mac = bytes.fromhex(request.headers["x-lintel-mac"])
@@ -877,8 +1020,15 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
             raise HTTPException(404, "no such door")
         if body.command == "reboot" and op["role"] != "admin":
             raise HTTPException(403, "admin role required to reboot a panel")
+        if body.command == "unlock" and not body.reason.strip():
+            raise HTTPException(400, "a reason is required to unlock a door remotely")
         cid = ctl.queue_command(door_id, COMMANDS[body.command])
-        journal(op, "door.command", f"{body.command.replace('_', ' ')} sent to door {door_id}", door_id=door_id)
+        if body.command == "unlock":
+            ev = store.journal("door.remote_unlock", door_id=door_id, operator=op["username"],
+                               detail=f"door released remotely by {op['username']}: {body.reason.strip()}")
+            hub.publish({"type": "event", "event": ev})
+        else:
+            journal(op, "door.command", f"{body.command.replace('_', ' ')} sent to door {door_id}", door_id=door_id)
         return {"ok": True, "command_id": cid}
 
     @app.post("/api/door/{door_id}/media", dependencies=[Depends(controller_auth)])
@@ -1065,7 +1215,11 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
 
     @app.websocket("/ws")
     async def ws(sock: WebSocket) -> None:
-        if operator_from_token(sock.cookies.get("lintel_session")) is None:
+        origin = sock.headers.get("origin")
+        if origin and origin.split("://", 1)[-1] != sock.headers.get("host", ""):
+            await sock.close(code=4403)  # cross-site WebSocket hijacking
+            return
+        if operator_from_token(sock.cookies.get(COOKIE) or sock.cookies.get("lintel_session")) is None:
             await sock.close(code=4401)
             return
         await sock.accept()
