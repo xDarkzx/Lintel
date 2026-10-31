@@ -48,6 +48,7 @@ MIN_SHARPNESS = 25.0     # variance of the Laplacian over the face
 SESSION_S = 90
 MAX_FRAMES = 400
 MAX_TEMPLATES = 3
+SESSIONS_PER_OPERATOR = 2  # live enrolment sessions one admin can hold at once
 
 INSTRUCTIONS = {"front": "Look straight at the camera",
                 "left": "Slowly turn your head to your left",
@@ -139,6 +140,7 @@ class Enrolment:
     templates: list[tuple[float, int, np.ndarray]] = field(default_factory=list)  # (quality, step, embedding)
     real_scores: list[float] = field(default_factory=list)
     logged: bool = False  # the failure has been written to the journal
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False)  # frames are judged one at a time
 
     def view(self) -> dict:
         current = self.steps[self.step] if self.step < len(self.steps) else None
@@ -173,6 +175,9 @@ class EnrolmentService:
         with self._lock:
             for k in [k for k, s in self.sessions.items() if now - s.started > SESSION_S * 2]:
                 del self.sessions[k]
+            mine = sorted((s for s in self.sessions.values() if s.operator == operator), key=lambda s: s.started)
+            for s in mine[:max(0, len(mine) - SESSIONS_PER_OPERATOR + 1)]:
+                del self.sessions[s.id]  # starting another ends that admin's oldest
             e = Enrolment(secrets.token_urlsafe(16), cardholder_id, operator, new_steps())
             self.sessions[e.id] = e
         return e

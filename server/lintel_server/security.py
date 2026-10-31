@@ -11,7 +11,9 @@ import ipaddress
 import secrets
 import socket
 import struct
+import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -60,33 +62,130 @@ LOGIN_MAX_FAILURES = 5
 LOGIN_LOCK_S = 15 * 60
 
 
+LOGIN_MAX_TRACKED = 10_000  # names and addresses remembered at once
+
+
 @dataclass
 class LoginThrottle:
     """Per-username and per-address failure counting. A locked name or address
-    is refused before the password is even checked."""
-    failures: dict[str, list[float]] = field(default_factory=dict)
-    locked: dict[str, float] = field(default_factory=dict)
+    is refused before the password is even checked.
+
+    Sign-ins run on parallel worker threads, so every update holds a lock: two
+    wrong passwords at the same instant must both count. Entries are kept in
+    order of last activity, so expiry and eviction cost O(1) per sign-in and no
+    more than LOGIN_MAX_TRACKED are kept: guessing with random names cannot
+    grow memory or slow sign-in down."""
+    failures: OrderedDict = field(default_factory=OrderedDict)  # key -> failure times, oldest activity first
+    locked: OrderedDict = field(default_factory=OrderedDict)    # key -> locked until, in lock order
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def blocked(self, *keys: str, now: float | None = None) -> int:
         now = time.time() if now is None else now
-        return max([0] + [int(self.locked.get(k, 0) - now) for k in keys])
+        with self._lock:
+            return max([0] + [int(self.locked.get(k, 0) - now) for k in keys])
 
     def fail(self, *keys: str, now: float | None = None) -> bool:
         """Records a failure; True when this failure triggered a lock."""
         now = time.time() if now is None else now
         tripped = False
-        for k in keys:
-            recent = [t for t in self.failures.get(k, []) if now - t < LOGIN_LOCK_S] + [now]
-            self.failures[k] = recent
-            if len(recent) >= LOGIN_MAX_FAILURES and self.locked.get(k, 0) < now:
-                self.locked[k] = now + LOGIN_LOCK_S
-                self.failures[k] = []
-                tripped = True
+        with self._lock:
+            self._prune(now)
+            for k in keys:
+                if self.locked.get(k, 0) > now:
+                    continue  # already locked: more failures change nothing and must not pile up
+                recent = [t for t in self.failures.get(k, []) if now - t < LOGIN_LOCK_S] + [now]
+                self.failures[k] = recent
+                self.failures.move_to_end(k)
+                if len(recent) >= LOGIN_MAX_FAILURES:
+                    self.locked[k] = now + LOGIN_LOCK_S
+                    self.locked.move_to_end(k)
+                    self.failures[k] = []
+                    tripped = True
+            while len(self.failures) > LOGIN_MAX_TRACKED:
+                self.failures.popitem(last=False)
+            while len(self.locked) > LOGIN_MAX_TRACKED:
+                self.locked.popitem(last=False)
         return tripped
 
     def succeed(self, *keys: str) -> None:
-        for k in keys:
-            self.failures.pop(k, None)
+        with self._lock:
+            for k in keys:
+                self.failures.pop(k, None)
+
+    def _prune(self, now: float) -> None:
+        # Both maps are ordered oldest first, so expired entries are all at the front.
+        while self.failures:
+            k, ts = next(iter(self.failures.items()))
+            if ts and now - ts[-1] < LOGIN_LOCK_S:
+                break
+            del self.failures[k]
+        while self.locked:
+            k, until = next(iter(self.locked.items()))
+            if until > now:
+                break
+            del self.locked[k]
+
+    def size(self) -> int:
+        with self._lock:
+            return len(self.failures) + len(self.locked)
+
+
+# ---- request size limit ---------------------------------------------------------------------
+
+MAX_BODY_BYTES = 25_000_000  # the largest legitimate upload is a 20 MB floor plan
+
+
+class BodyLimit:
+    """ASGI middleware refusing request bodies over MAX_BODY_BYTES before any
+    handler reads them, whether or not the client declared a length: a client
+    cannot make the server buffer gigabytes into memory."""
+
+    def __init__(self, app, limit: int = MAX_BODY_BYTES) -> None:
+        self.app, self.limit = app, limit
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        declared = dict(scope.get("headers") or []).get(b"content-length")
+        if declared is not None:
+            # The HTTP layer enforces the declared length, so checking it is enough.
+            if not declared.isdigit() or int(declared) > self.limit:
+                return await _too_large(send)
+            return await self.app(scope, receive, send)
+        # No declared length (chunked): read it here, up to the limit, then
+        # hand the app the whole body. Over the limit, the app never runs.
+        chunks, seen = [], 0
+        while True:
+            msg = await receive()
+            if msg["type"] != "http.request":
+                return await self.app(scope, _replay([msg], receive), send)
+            seen += len(msg.get("body", b""))
+            if seen > self.limit:
+                return await _too_large(send)
+            chunks.append(msg.get("body", b""))
+            if not msg.get("more_body"):
+                break
+        await self.app(scope, _replay([{"type": "http.request", "body": b"".join(chunks), "more_body": False}],
+                                      receive), send)
+
+
+def _replay(messages, upstream):
+    """Hands the app the buffered messages, then the real connection, so
+    streaming responses still learn when the client actually goes away."""
+    pending = list(messages)
+
+    async def receive():
+        if pending:
+            return pending.pop(0)
+        return await upstream()
+    return receive
+
+
+async def _too_large(send) -> None:
+    body = b'{"detail":"request body too large"}'
+    await send({"type": "http.response.start", "status": 413,
+                "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode())]})
+    await send({"type": "http.response.body", "body": body})
 
 
 # ---- TLS ----------------------------------------------------------------------------------
@@ -129,4 +228,5 @@ SECURITY_HEADERS = {
     # nothing embedded or third-party can.
     "Permissions-Policy": "camera=(self), microphone=(), geolocation=()",
     "Cross-Origin-Opener-Policy": "same-origin",
+    "Cross-Origin-Resource-Policy": "same-origin",  # no other site may embed our photos or plans
 }

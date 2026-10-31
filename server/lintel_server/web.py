@@ -24,12 +24,13 @@ from . import adopt, notify
 from .controller import Controller, photo_key
 from .photos import stamp_photo
 from .protocol import COMMANDS, SiteMode
-from .security import (SECURITY_HEADERS, LoginThrottle, totp_new_secret, totp_uri, totp_verify)
+from .security import (SECURITY_HEADERS, BodyLimit, LoginThrottle, totp_new_secret, totp_uri, totp_verify)
 from .store import Store, check_password, hash_password
 
 STATIC = Path(__file__).parent / "static"
 SESSION_S = 12 * 3600
 IDLE_S = 30 * 60
+WS_RECHECK_S = 30  # the live feed re-checks its session at least this often
 COOKIE = "__Host-lintel_session"  # HTTPS only, host-locked, path=/
 MAX_IMAGE_PIXELS = 24_000_000
 # A PIN entry's face counts as someone else only when it is clearly a face
@@ -263,7 +264,12 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
             response.headers.setdefault(k, v)
         if request.url.scheme == "https":
             response.headers.setdefault("Strict-Transport-Security", "max-age=31536000")
+        if request.url.path.startswith("/api/"):
+            # Cardholder data, photos and audit records never go into a browser or proxy cache.
+            response.headers.setdefault("Cache-Control", "no-store")
         return response
+
+    app.add_middleware(BodyLimit)
 
     def controller_auth(request: Request) -> None:
         """Door controllers present the site's controller token."""
@@ -273,7 +279,9 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
 
     # ---- auth ------------------------------------------------------------------
 
-    def operator_from_token(token: str | None) -> dict | None:
+    def operator_from_token(token: str | None, touch: bool = True) -> dict | None:
+        """The signed-in operator, or None. `touch` counts this as activity for
+        the idle timeout; a background re-check must not keep a session alive."""
         if not token:
             return None
         th = hashlib.sha256(token.encode()).hexdigest()
@@ -285,7 +293,8 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
         if r["last_seen"] and now - r["last_seen"] > IDLE_S:
             store.x("DELETE FROM sessions WHERE token_hash=?", (th,))
             return None
-        store.x("UPDATE sessions SET last_seen=? WHERE token_hash=?", (now, th))
+        if touch:
+            store.x("UPDATE sessions SET last_seen=? WHERE token_hash=?", (now, th))
         return dict(r)
 
     def session_token(request: Request) -> str | None:
@@ -399,6 +408,11 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
 
     @app.put("/api/settings/webhook")
     def put_webhook(body: WebhookIn, op: dict = Depends(admin)) -> dict:
+        if body.url:
+            try:
+                notify.resolve_webhook(body.url)
+            except notify.WebhookError as e:
+                raise HTTPException(400, str(e))
         store.set_setting("alarm_webhook", body.url)
         store.set_setting("alarm_webhook_priority", str(body.min_priority))
         journal(op, "settings.updated", "alarm webhook " + ("set" if body.url else "cleared"))
@@ -914,14 +928,21 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
         if not 0 < len(body) <= 2_000_000:
             raise HTTPException(413, "frame too large")
         check_image(body)
-        await run_in_threadpool(enrolment.frame, e, body)
-        if e.state == "done":
-            await run_in_threadpool(save_enrolment, e, op)
-        elif e.state == "failed" and not e.logged:
-            e.logged = True
-            journal(op, "cardholder.face_enrol_failed", f"live enrolment failed: {e.message}",
-                    cardholder_id=e.cardholder_id)
-        return e.view()
+
+        def step() -> dict:
+            # One frame at a time per session: judging a frame and saving the
+            # result must not interleave, or two frames could both save.
+            with e.lock:
+                enrolment.frame(e, body)
+                if e.state == "done":
+                    save_enrolment(e, op)
+                elif e.state == "failed" and not e.logged:
+                    e.logged = True
+                    journal(op, "cardholder.face_enrol_failed", f"live enrolment failed: {e.message}",
+                            cardholder_id=e.cardholder_id)
+                return e.view()
+
+        return await run_in_threadpool(step)
 
     @app.delete("/api/cardholders/{cid}/faces")
     def clear_faces(cid: int, op: dict = Depends(admin)) -> dict:
@@ -956,11 +977,14 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
         """A panel's face scan, relayed by its controller and signed like photos.
         The result is held for the CredReq that follows; the controller learns
         only whether a face was usable, never who it was."""
+        from starlette.concurrency import run_in_threadpool
         from .faces import FaceError
         link = ctl.doors.get(door_id)
         if link is None:
             raise HTTPException(404, "unknown door")
         body = await request.body()
+        if not 0 < len(body) <= 2_000_000:
+            raise HTTPException(413, "face image too large")
         try:
             ref = int(request.headers["x-lintel-req"])
             mac = bytes.fromhex(request.headers["x-lintel-mac"])
@@ -970,13 +994,15 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
                         hashlib.sha256).digest()
         if not hmac.compare_digest(mac, want) or ref == 0:
             raise HTTPException(403, "bad signature")
+        check_image(body)
+        # Model inference off the event loop, which also answers every keypad.
         try:
-            r = need_faces().analyse(body)
+            r = await run_in_threadpool(need_faces().analyse, body)
         except FaceError as e:
-            ctl.face_results[(door_id, ref)] = (None, 0.0, time.time(), body, str(e))
+            ctl.hold_face(door_id, ref, (None, 0.0, time.time(), body, str(e)))
             return {"ok": True, "face": False, "why": str(e)}
         cid, score = need_faces().best_match(r.embedding, templates())
-        ctl.face_results[(door_id, ref)] = (cid, score, time.time(), body, None)
+        ctl.hold_face(door_id, ref, (cid, score, time.time(), body, None))
         return {"ok": True, "face": True}
 
     # ---- events, reports, journal ----------------------------------------------------------
@@ -1548,7 +1574,8 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
         if origin and origin.split("://", 1)[-1] != sock.headers.get("host", ""):
             await sock.close(code=4403)  # cross-site WebSocket hijacking
             return
-        if operator_from_token(sock.cookies.get(COOKIE) or sock.cookies.get("lintel_session")) is None:
+        token = sock.cookies.get(COOKIE) or sock.cookies.get("lintel_session")
+        if operator_from_token(token) is None:
             await sock.close(code=4401)
             return
         await sock.accept()
@@ -1556,7 +1583,17 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
         hub.queues.add(q)
         try:
             while True:
-                await sock.send_json(await q.get())
+                try:
+                    msg = await asyncio.wait_for(q.get(), timeout=WS_RECHECK_S)
+                except asyncio.TimeoutError:
+                    msg = None
+                # Signing out, an expired or idle session, or a disabled account
+                # ends the live feed too, not just the next page load.
+                if operator_from_token(token, touch=False) is None:
+                    await sock.close(code=4401)
+                    return
+                if msg is not None:
+                    await sock.send_json(msg)
         except (WebSocketDisconnect, RuntimeError):
             pass
         finally:

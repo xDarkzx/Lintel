@@ -37,6 +37,7 @@ add_executable(lintel_tests
     test_link.cpp
     test_system.cpp
     test_adopt.cpp
+    test_fuzz.cpp
 )
 target_link_libraries(lintel_tests PRIVATE lintel_core GTest::gtest_main)
 

@@ -38,6 +38,7 @@ REASON_TEXT = {
     Reason.FACE_NOT_ENROLLED: "no face enrolled for this person",
 }
 FACE_RESULT_TTL_S = 30
+FACE_RESULTS_MAX = 64  # face images held for a request at once, across all doors
 
 
 def photo_key(door_key: bytes) -> bytes:
@@ -244,6 +245,17 @@ class Controller:
         self.store.x("UPDATE alarms SET state='cleared' WHERE door_id=? AND kind=? AND state!='cleared'",
                      (door_id, kind))
         self.publish({"type": "alarms"})
+
+    def hold_face(self, door_id: int, ref: int, result: tuple) -> None:
+        """Keeps a face result for the request that cites it. Results nobody
+        claims expire, and at most FACE_RESULTS_MAX are held, so face images
+        cannot pile up in memory."""
+        now = time.time()
+        for k in [k for k, v in self.face_results.items() if now - v[2] > FACE_RESULT_TTL_S]:
+            del self.face_results[k]
+        while len(self.face_results) >= FACE_RESULTS_MAX:
+            del self.face_results[min(self.face_results, key=lambda k: self.face_results[k][2])]
+        self.face_results[(door_id, ref)] = result
 
     def queue_command(self, door_id: int, command: int) -> int:
         self.next_command_id = (self.next_command_id + 1) & 0x7FFFFFFF or 1

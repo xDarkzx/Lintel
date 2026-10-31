@@ -48,7 +48,7 @@ constexpr uint32_t kAckTimeoutMs = 1500;
 constexpr uint32_t kHeartbeatMs = 5000;
 constexpr int kMissedForOffline = 2;
 constexpr uint16_t kPhotoChunk = 1000;
-constexpr const char* kFirmware = "0.6.1";
+constexpr const char* kFirmware = "0.6.2";
 constexpr uint32_t kDiagMs = 30000;
 constexpr uint32_t kWatchIntervalMs = 350;  // about three frames a second while the door is open
 constexpr uint32_t kWatchTailMs = 2000;     // and a little after it relocks
@@ -85,6 +85,7 @@ struct PinMsg {
 
 struct DownFrame {
     uint8_t len;
+    uint32_t at;  // when it arrived, so a reply read later is still timed truly
     uint8_t data[kMaxFrame];
 };
 
@@ -107,6 +108,7 @@ void on_down_frame(const uint8_t* f, size_t len, void*) {
     if (len == 0 || len > kMaxFrame) return;
     DownFrame d;
     d.len = static_cast<uint8_t>(len);
+    d.at = now_ms();
     std::memcpy(d.data, f, len);
     xQueueSend(s_down_q, &d, 0);
 }
@@ -126,7 +128,8 @@ size_t bound_counter_offset(MsgType t) { return t == MsgType::HeartbeatAck ? 7 :
 
 // Waits for an authenticated `type` reply that answers request `ctr`.
 // Late replies, replays and forgeries are all dropped.
-bool await_reply(MsgType type, uint32_t ctr, uint8_t* pt, size_t& len, uint32_t timeout_ms) {
+bool await_reply(MsgType type, uint32_t ctr, uint8_t* pt, size_t& len, uint32_t timeout_ms,
+                 uint32_t* arrived = nullptr) {
     uint32_t deadline = now_ms() + timeout_ms;
     size_t off = bound_counter_offset(type);
     DownFrame d;
@@ -146,7 +149,10 @@ bool await_reply(MsgType type, uint32_t ctr, uint8_t* pt, size_t& len, uint32_t 
             continue;
         }
         s_rx.commit(h.counter);
-        if (h.type == type && len >= off + 4 && get_u32(pt + off) == ctr) return true;
+        if (h.type == type && len >= off + 4 && get_u32(pt + off) == ctr) {
+            if (arrived != nullptr) *arrived = d.at;
+            return true;
+        }
     }
 }
 
@@ -454,16 +460,19 @@ void on_submit(const char* pin, void*) {
 }
 
 void handle_pin(const PinMsg& m) {
-    // Photograph the person at the moment they press OK, before the decision,
-    // while they are still facing the panel. Every attempt is recorded.
+    uint32_t pressed = now_ms();
+    // Every attempt is photographed. On face + PIN doors the face is part of
+    // the decision, so it is taken first; on PIN doors the request goes out
+    // first and the photo is taken while the reply travels, so the camera
+    // adds nothing to the time it takes to open the door.
     uint8_t* jpg = nullptr;
     size_t jpg_len = 0;
-    if (!camera_snapshot(&jpg, &jpg_len, 600)) jpg = nullptr;
+    bool face_pin = s_cred_mode == static_cast<uint8_t>(CredMode::FaceAndPin);
+    if (face_pin && !camera_snapshot(&jpg, &jpg_len, 600)) jpg = nullptr;
 
     // Face + PIN doors decide on both at once: the signed face image goes
     // first (the controller delivers it before relaying anything else), then
     // one request carrying the PIN and the image's reference.
-    bool face_pin = s_cred_mode == static_cast<uint8_t>(CredMode::FaceAndPin);
     uint8_t pt[CredReq::kLen > PinReq::kLen ? CredReq::kLen : PinReq::kLen] = {};
     size_t pt_len = 0;
     MsgType type = MsgType::PinReq;
@@ -492,12 +501,15 @@ void handle_pin(const PinMsg& m) {
     }
 
     uint32_t ctr = 0;
-    uint32_t t0 = now_ms();
+    uint32_t sent_at = now_ms();
     uint8_t reply[kMaxPayload];
     size_t len = 0;
     PinResp resp{};
-    bool ok = usb_link_host_connected() && send_frame(type, pt, pt_len, ctr) &&
-              await_reply(MsgType::PinResp, ctr, reply, len, kRespTimeoutMs) && decode(reply, len, resp);
+    bool sent = usb_link_host_connected() && send_frame(type, pt, pt_len, ctr);
+    if (sent && !face_pin && !camera_snapshot(&jpg, &jpg_len, 600)) jpg = nullptr;
+    uint32_t arrived = 0;
+    bool ok = sent && await_reply(MsgType::PinResp, ctr, reply, len, kRespTimeoutMs, &arrived) &&
+              decode(reply, len, resp);
     secure_zero(pt, sizeof(pt));
     if (!ok) {
         ESP_LOGW(TAG, "no valid reply from server");
@@ -505,9 +517,11 @@ void handle_pin(const PinMsg& m) {
         ui_show_denied("Access denied", "Server could not be reached.\nDoor stays locked.");
         return;
     }
-    s_last_decision_ms = now_ms() - t0;
-    ESP_LOGI(TAG, "decision %s (%s) in %lu ms", resp.decision == Decision::Grant ? "GRANT" : "DENY",
-             reason_name(resp.reason), static_cast<unsigned long>(now_ms() - t0));
+    // What the person at the door feels: from pressing OK to the decision.
+    s_last_decision_ms = now_ms() - pressed;
+    ESP_LOGI(TAG, "decision %s (%s): round trip %lu ms, OK to decision %lu ms",
+             resp.decision == Decision::Grant ? "GRANT" : "DENY", reason_name(resp.reason),
+             static_cast<unsigned long>(arrived - sent_at), static_cast<unsigned long>(s_last_decision_ms));
     if (resp.decision == Decision::Grant) {
         char title[40];
         std::snprintf(title, sizeof(title), "Welcome%s%s", resp.name[0] ? ", " : "", resp.name);

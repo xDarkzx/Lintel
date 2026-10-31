@@ -26,6 +26,7 @@ import io
 import logging
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -39,6 +40,7 @@ MIN_HEIGHT_FRAC = 0.30    # near the door: people further away are passers-by
 CONFIRM_FRAMES = 2        # an extra person must be seen in at least this many frames
 MAX_FRAMES = 32
 MAX_FRAME_MS = 60_000
+DONE_REMEMBERED = 1024     # finished bursts remembered, to refuse late or replayed frames
 SESSION_TIMEOUT_S = 25.0  # analyse with what arrived if frames go missing
 CREDENTIAL_SLACK_S = 2.0  # grants this close to the window count as legitimate entries
 
@@ -161,6 +163,7 @@ class WatchManager:
                  stamp: Callable[..., str]) -> None:
         self.store, self.detector, self.publish, self.stamp = store, detector, publish, stamp
         self._sessions: dict[tuple[int, int], Session] = {}
+        self._done: OrderedDict[tuple[int, int], float] = OrderedDict()  # finished bursts, oldest first
         self._lock = threading.Lock()
 
     def add_frame(self, door_id: int, door_name: str, event: dict[str, Any], req: int, index: int, total: int,
@@ -168,6 +171,8 @@ class WatchManager:
         """Returns False if this frame was already received."""
         key = (door_id, req)
         with self._lock:
+            if key in self._done:
+                return False  # this burst was already analysed: a late or replayed frame
             s = self._sessions.get(key)
             if s is None:
                 s = self._sessions[key] = Session(door_id, door_name, event, total, time.time())
@@ -185,6 +190,10 @@ class WatchManager:
     def _finish(self, key: tuple[int, int]) -> None:
         with self._lock:
             s = self._sessions.pop(key, None)
+            if s is not None:
+                self._done[key] = time.time()
+                while len(self._done) > DONE_REMEMBERED:
+                    self._done.popitem(last=False)
         if s is None:
             return  # already analysed
         try:

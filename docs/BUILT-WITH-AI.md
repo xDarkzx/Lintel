@@ -113,6 +113,23 @@ unhealthy ever since; nobody noticed until the agent looked at `docker ps`.
 *Lesson: a security change needs a check that the system still works, not
 just that the hole is closed.*
 
+**A 200 ms delay hiding in one line.** Asked whether a 10 ms response was
+realistic, the agent measured instead of guessing: the server decided in about
+1 ms, yet the keypad reported 323 ms. The door controller read the USB link in
+4 KB blocks with a 200 ms timeout, so every 40-byte PIN request waited out the
+timeout. Reading what has arrived, as soon as it arrives, removed it; the
+keypad now also sends the PIN before taking its photo. *Lesson: measure each
+hop; the slow part is rarely where the work is.*
+
+**Hardening tests that found what review missed.** Writing tests for memory,
+races and limits found a locked-out address whose failed sign-ins were still
+appended to a list nobody cleared (a leak, and a slowdown that grew with the
+attack), door frames that started a fresh analysis when resent after their
+burst had finished (a replay route), and a request-size guard that silently
+emptied every streamed download until a test noticed. Each now has a test
+that fails if the protection is removed, and the server's decision time has a
+10 ms budget enforced in CI.
+
 ## What it was genuinely good at
 
 - Writing the protocol core, X25519 adoption and TOTP against published test

@@ -347,7 +347,12 @@ class DoorController:
                 self.send_panel(PING)
                 last_ping = time.time()
                 while True:
-                    data = self.ser.read(4096)
+                    # Return as soon as anything arrives: read(4096) would wait out the
+                    # whole timeout for a 40-byte PIN request, adding up to 200 ms to
+                    # every entry. Block for the first byte, then take what is buffered.
+                    data = self.ser.read(1)
+                    if data and self.ser.in_waiting:
+                        data += self.ser.read(self.ser.in_waiting)
                     for ptype, payload in reader.feed(data):
                         self.on_packet(ptype, payload)
                     if time.time() - last_ping > 5:
