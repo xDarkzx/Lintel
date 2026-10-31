@@ -31,6 +31,8 @@ enum class MsgType : uint8_t {
     Event = 5,         // door -> controller: alarms and offline decisions
     Mode = 6,          // controller -> all doors (broadcast key): lockdown etc.
     CacheChunk = 7,    // controller -> door: offline allow-list chunk
+    PinReq = 8,        // keypad -> controller: a PIN was entered
+    PinResp = 9,       // controller -> keypad: decision bound to one PinReq
 };
 
 enum class Dir : uint8_t {

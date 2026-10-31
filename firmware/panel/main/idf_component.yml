@@ -1,5 +1,6 @@
 dependencies:
   idf: ">=5.4"
-  # Must match the esp_hosted slave flashed on the onboard ESP32-C6 (2.12.8).
+  lvgl/lvgl: "8.4.*"
+  # Must match the esp_hosted slave on the onboard ESP32-C6 (2.12.8).
   espressif/esp_hosted: "2.12.8"
   espressif/esp_wifi_remote: "1.2.*"

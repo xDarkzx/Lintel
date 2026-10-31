@@ -28,7 +28,7 @@ void write_header(const Header& h, uint8_t* p) {
 
 bool msg_type_valid(uint8_t raw) {
     return raw >= static_cast<uint8_t>(MsgType::AccessReq) &&
-           raw <= static_cast<uint8_t>(MsgType::CacheChunk);
+           raw <= static_cast<uint8_t>(MsgType::PinResp);
 }
 
 Dir dir_for(MsgType t) {
@@ -36,12 +36,14 @@ Dir dir_for(MsgType t) {
         case MsgType::AccessReq:
         case MsgType::Heartbeat:
         case MsgType::Event:
+        case MsgType::PinReq:
             return Dir::DoorToCtrl;
         case MsgType::Mode:
             return Dir::Broadcast;
         case MsgType::AccessResp:
         case MsgType::HeartbeatAck:
         case MsgType::CacheChunk:
+        case MsgType::PinResp:
         default:
             return Dir::CtrlToDoor;
     }

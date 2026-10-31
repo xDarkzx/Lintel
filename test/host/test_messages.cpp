@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <string>
+
 #include "lintel/frame.h"
 #include "lintel/messages.h"
 #include "test_util.h"
@@ -106,4 +108,38 @@ TEST(Messages, PayloadsFitOneLoRaFrame) {
     EXPECT_LE(AccessReq::kLen, 32u);
     EXPECT_LE(Event::kLen, 40u);
     EXPECT_LE(CacheChunk::kFixedLen + kCacheEntriesPerChunk * kCacheEntryLen, kMaxPayload);
+}
+
+TEST(Messages, PinReqValidatesDigitsAndPadding) {
+    PinReq r{};
+    r.pin_len = 4;
+    std::memcpy(r.pin, "1234", 4);
+    uint8_t buf[32];
+    ASSERT_EQ(encode(r, buf), PinReq::kLen);
+    PinReq g{};
+    ASSERT_TRUE(decode(buf, PinReq::kLen, g));
+    EXPECT_EQ(std::string(g.pin, 4), "1234");
+    buf[2] = 'x';
+    EXPECT_FALSE(decode(buf, PinReq::kLen, g));
+    buf[2] = '2';
+    buf[6] = '9';  // garbage after the PIN
+    EXPECT_FALSE(decode(buf, PinReq::kLen, g));
+    buf[6] = 0;
+    buf[0] = 3;  // too short
+    EXPECT_FALSE(decode(buf, PinReq::kLen, g));
+}
+
+TEST(Messages, PinRespRoundTrip) {
+    PinResp r{99, Decision::Grant, Reason::Ok, 5000, 0, {}};
+    std::strncpy(r.name, "Dan", sizeof(r.name));
+    uint8_t buf[64];
+    encode(r, buf);
+    PinResp g{};
+    ASSERT_TRUE(decode(buf, PinResp::kLen, g));
+    EXPECT_EQ(g.req_counter, 99u);
+    EXPECT_STREQ(g.name, "Dan");
+    PinResp lock{5, Decision::Deny, Reason::LockedOut, 0, 30, {}};
+    encode(lock, buf);
+    ASSERT_TRUE(decode(buf, PinResp::kLen, g));
+    EXPECT_EQ(g.lockout_s, 30);
 }

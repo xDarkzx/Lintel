@@ -29,6 +29,8 @@ enum class Reason : uint8_t {
     OutsideSchedule = 7,
     Lockdown = 8,
     Offline = 9,       // decided by the door without the controller
+    BadPin = 10,       // no user has this PIN
+    LockedOut = 11,    // too many wrong PINs at this keypad
 };
 
 const char* reason_name(Reason r);
@@ -116,6 +118,26 @@ struct CacheChunk {
     size_t encoded_len() const { return kFixedLen + count * kCacheEntryLen; }
 };
 
+constexpr size_t kPinMaxLen = 8;
+constexpr size_t kNameMaxLen = 16;
+
+struct PinReq {
+    static constexpr size_t kLen = 1 + kPinMaxLen + 1;
+    uint8_t pin_len;
+    char pin[kPinMaxLen];  // ASCII digits, zero padded
+    uint8_t status;
+};
+
+struct PinResp {
+    static constexpr size_t kLen = 4 + 1 + 1 + 2 + 2 + kNameMaxLen;
+    uint32_t req_counter;
+    Decision decision;
+    Reason reason;
+    uint16_t unlock_ms;
+    uint16_t lockout_s;      // LockedOut: seconds until the keypad accepts PINs again
+    char name[kNameMaxLen];  // greeting on grant, zero padded
+};
+
 // Offline cache entry: first 8 bytes of SHA-256(UID).
 bool uid_cache_tag(const uint8_t uid[kUidLen], uint8_t out[kCacheEntryLen]);
 
@@ -126,6 +148,8 @@ size_t encode(const HeartbeatAck& m, uint8_t* out);
 size_t encode(const Event& m, uint8_t* out);
 size_t encode(const ModeMsg& m, uint8_t* out);
 size_t encode(const CacheChunk& m, uint8_t* out);
+size_t encode(const PinReq& m, uint8_t* out);
+size_t encode(const PinResp& m, uint8_t* out);
 
 bool decode(const uint8_t* p, size_t len, AccessReq& m);
 bool decode(const uint8_t* p, size_t len, AccessResp& m);
@@ -134,5 +158,7 @@ bool decode(const uint8_t* p, size_t len, HeartbeatAck& m);
 bool decode(const uint8_t* p, size_t len, Event& m);
 bool decode(const uint8_t* p, size_t len, ModeMsg& m);
 bool decode(const uint8_t* p, size_t len, CacheChunk& m);
+bool decode(const uint8_t* p, size_t len, PinReq& m);
+bool decode(const uint8_t* p, size_t len, PinResp& m);
 
 }  // namespace lintel

@@ -1,0 +1,17 @@
+menu "Lintel panel"
+    config PANEL_DOOR_NAME
+        string "Door name shown on the panel"
+        default "Main Entrance"
+    config PANEL_WIFI_SSID
+        string "Wi-Fi SSID (empty = use what the C6 has stored)"
+        default ""
+    config PANEL_WIFI_PASS
+        string "Wi-Fi password"
+        default ""
+    config PANEL_SERVER_HOST
+        string "Lintel server IP"
+        default "192.168.87.10"
+    config PANEL_SERVER_PORT
+        int "Lintel server UDP port"
+        default 47800
+endmenu

@@ -18,6 +18,8 @@ const char* reason_name(Reason r) {
         case Reason::OutsideSchedule: return "outside-schedule";
         case Reason::Lockdown: return "lockdown";
         case Reason::Offline: return "offline";
+        case Reason::BadPin: return "bad-pin";
+        case Reason::LockedOut: return "locked-out";
     }
     return "?";
 }
@@ -58,7 +60,7 @@ size_t encode(const AccessResp& m, uint8_t* out) {
 bool decode(const uint8_t* p, size_t len, AccessResp& m) {
     if (len != AccessResp::kLen) return false;
     if (p[4] > static_cast<uint8_t>(Decision::Grant)) return false;
-    if (p[5] > static_cast<uint8_t>(Reason::Offline)) return false;
+    if (p[5] > static_cast<uint8_t>(Reason::LockedOut)) return false;
     m.req_counter = get_u32(p);
     m.decision = static_cast<Decision>(p[4]);
     m.reason = static_cast<Reason>(p[5]);
@@ -166,6 +168,49 @@ bool decode(const uint8_t* p, size_t len, CacheChunk& m) {
     if (m.total == 0 || m.index >= m.total) return false;
     std::memcpy(m.entries, p + CacheChunk::kFixedLen, count * kCacheEntryLen);
     return true;
+}
+
+size_t encode(const PinReq& m, uint8_t* out) {
+    out[0] = m.pin_len;
+    std::memcpy(out + 1, m.pin, kPinMaxLen);
+    out[1 + kPinMaxLen] = m.status;
+    return PinReq::kLen;
+}
+
+bool decode(const uint8_t* p, size_t len, PinReq& m) {
+    if (len != PinReq::kLen || p[0] < 4 || p[0] > kPinMaxLen) return false;
+    m.pin_len = p[0];
+    std::memcpy(m.pin, p + 1, kPinMaxLen);
+    for (size_t i = 0; i < kPinMaxLen; ++i) {
+        bool digit = m.pin[i] >= '0' && m.pin[i] <= '9';
+        if (i < m.pin_len ? !digit : m.pin[i] != 0) return false;
+    }
+    m.status = p[1 + kPinMaxLen];
+    return true;
+}
+
+size_t encode(const PinResp& m, uint8_t* out) {
+    put_u32(out, m.req_counter);
+    out[4] = static_cast<uint8_t>(m.decision);
+    out[5] = static_cast<uint8_t>(m.reason);
+    put_u16(out + 6, m.unlock_ms);
+    put_u16(out + 8, m.lockout_s);
+    std::memcpy(out + 10, m.name, kNameMaxLen);
+    return PinResp::kLen;
+}
+
+bool decode(const uint8_t* p, size_t len, PinResp& m) {
+    if (len != PinResp::kLen) return false;
+    if (p[4] > static_cast<uint8_t>(Decision::Grant)) return false;
+    if (p[5] > static_cast<uint8_t>(Reason::LockedOut)) return false;
+    m.req_counter = get_u32(p);
+    m.decision = static_cast<Decision>(p[4]);
+    m.reason = static_cast<Reason>(p[5]);
+    m.unlock_ms = get_u16(p + 6);
+    m.lockout_s = get_u16(p + 8);
+    std::memcpy(m.name, p + 10, kNameMaxLen);
+    m.name[kNameMaxLen - 1] = 0;
+    return (m.decision == Decision::Grant) == (m.reason == Reason::Ok);
 }
 
 }  // namespace lintel
