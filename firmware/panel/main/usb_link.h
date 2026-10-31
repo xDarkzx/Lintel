@@ -33,6 +33,9 @@ constexpr uint8_t kLinkAnnounce = 0x89;    // pubkey[32] then "serial=.. mac=.. 
 constexpr uint8_t kLinkMediaStart = 0x8A;  // u8 kind (1 screenshot, 2 test photo), u32 ref, u32 size, mac[32]
 constexpr uint8_t kLinkMediaChunk = 0x8B;
 constexpr uint8_t kLinkMediaEnd = 0x8C;
+constexpr uint8_t kLinkWatchStart = 0x8D;  // u32 req, u8 index, u8 total, u32 ms, u32 size, mac[32]
+constexpr uint8_t kLinkWatchChunk = 0x8E;  // one frame of the open-door burst, for tailgating detection
+constexpr uint8_t kLinkWatchEnd = 0x8F;
 
 using LinkFrameFn = void (*)(const uint8_t* frame, size_t len, void* ctx);
 

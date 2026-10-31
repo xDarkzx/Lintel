@@ -125,6 +125,8 @@ SECURITY_HEADERS = {
     "X-Content-Type-Options": "nosniff",
     "X-Frame-Options": "DENY",
     "Referrer-Policy": "no-referrer",
-    "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+    # The console's own pages may use the camera, for guided face enrolment;
+    # nothing embedded or third-party can.
+    "Permissions-Policy": "camera=(self), microphone=(), geolocation=()",
     "Cross-Origin-Opener-Policy": "same-origin",
 }

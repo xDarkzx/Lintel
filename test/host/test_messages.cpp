@@ -150,6 +150,22 @@ TEST(Messages, PinRespRoundTrip) {
     EXPECT_EQ(g.lockout_s, 30);
 }
 
+// Every refusal the server can give must reach the panel; a reason the panel
+// cannot decode looks like "no answer" at the door.
+TEST(Messages, PinRespCarriesEveryDenialReason) {
+    uint8_t buf[PinResp::kLen];
+    PinResp g{};
+    for (uint8_t r = 1; r <= static_cast<uint8_t>(kLastReason); ++r) {
+        PinResp d{7, Decision::Deny, static_cast<Reason>(r), 0, 0, {}};
+        encode(d, buf);
+        ASSERT_TRUE(decode(buf, PinResp::kLen, g)) << "reason " << int(r);
+        EXPECT_EQ(static_cast<uint8_t>(g.reason), r);
+        EXPECT_STRNE(reason_name(g.reason), "?");
+    }
+    buf[5] = static_cast<uint8_t>(kLastReason) + 1;
+    EXPECT_FALSE(decode(buf, PinResp::kLen, g));
+}
+
 TEST(Messages, CredReqCardAndPin) {
     CredReq r{};
     r.present = kCredCard | kCredPin;

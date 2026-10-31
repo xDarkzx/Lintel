@@ -103,7 +103,9 @@ class AccessEngine:
         return False
 
     def decide_pin(self, door_id: int, pin: str, now: float | None = None) -> Verdict:
-        return self.decide(door_id, pin=pin, now=now)
+        # A bare PIN request must respect the door's mode too, or a PIN alone
+        # would open a card-only or face + PIN door.
+        return self.decide(door_id, pin=pin, now=now, enforce_mode=True)
 
     def decide(self, door_id: int, *, pin: str | None = None, card: bytes | None = None,
                face: tuple[int | None, float] | None = None, now: float | None = None,
@@ -151,15 +153,24 @@ class AccessEngine:
             else:
                 ids.append(r["id"])
         if face is not None and failed is None:
-            if face[0] is None:
-                failed = Reason.NO_MATCH
-            else:
+            if face[0] is not None:
                 ids.append(face[0])
+            elif len(face) > 2 and face[2] == "no_face":
+                failed = Reason.NO_FACE
+            elif ids and not self.store.q1("SELECT 1 FROM face_templates WHERE cardholder_id=?", (ids[0],)):
+                failed = Reason.FACE_NOT_ENROLLED
+            else:
+                failed = Reason.NO_MATCH
         if failed is None and len(set(ids)) > 1:
             failed = Reason.MISMATCH
         if failed is not None:
+            owner = self.store.q1("SELECT * FROM cardholders WHERE id=?", (ids[0],)) if ids else None
+            # Not seeing a face, or having none enrolled, is not guessing: the
+            # credentials offered were right, so they do not count towards lockout.
+            if failed in (Reason.NO_FACE, Reason.FACE_NOT_ENROLLED):
+                return Verdict(Decision.DENY, failed, dict(owner) if owner else None, method=method)
             started = guard.fail(now)
-            return Verdict(Decision.DENY, Reason.LOCKED_OUT if started else failed,
+            return Verdict(Decision.DENY, Reason.LOCKED_OUT if started else failed, dict(owner) if owner else None,
                            lockout_s=guard.locked(now), lockout_started=started, method=method)
 
         ch = dict(self.store.q1("SELECT * FROM cardholders WHERE id=?", (ids[0],)))

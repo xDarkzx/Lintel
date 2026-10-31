@@ -32,6 +32,10 @@ SESSION_S = 12 * 3600
 IDLE_S = 30 * 60
 COOKIE = "__Host-lintel_session"  # HTTPS only, host-locked, path=/
 MAX_IMAGE_PIXELS = 24_000_000
+# A PIN entry's face counts as someone else only when it is clearly a face
+# and clearly unlike every face enrolled for that PIN (match threshold 0.42).
+IDENTITY_MIN_DETECT = 0.90
+IDENTITY_MISMATCH_BELOW = 0.25
 DUMMY_HASH = hash_password("not-a-real-password")  # equalises sign-in timing for unknown users
 
 
@@ -74,6 +78,7 @@ class SettingsIn(BaseModel):
     photo_retention_days: int | None = Field(None, ge=1, le=3650)
     rekey_days: int | None = Field(None, ge=1, le=365)
     require_admin_mfa: bool | None = None
+    tailgate_detection: bool | None = None
 
 
 class PasswordIn(BaseModel):
@@ -92,7 +97,7 @@ class DoorPatch(BaseModel):
     name: str | None = None
     area: str | None = None
     unlock_ms: int | None = Field(None, ge=1000, le=30000)
-    credential_mode: str | None = Field(None, pattern="^(pin|card|card_or_pin|card_and_pin)$")
+    credential_mode: str | None = Field(None, pattern="^(pin|card|card_or_pin|card_and_pin|face|face_and_pin)$")
     groups: list[int] | None = None
 
 
@@ -209,13 +214,22 @@ class CardEnrolIn(BaseModel):
     door_id: int = Field(ge=1, le=31)
 
 
-def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: Any = None) -> FastAPI:
+def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: Any = None,
+               people: Any = None, live: Any = None) -> FastAPI:
     import os
     docs = os.environ.get("LINTEL_API_DOCS") == "1"  # the API map is only published when asked for
     app = FastAPI(title="Lintel Access Control", docs_url="/api/docs" if docs else None, redoc_url=None,
                   openapi_url="/api/openapi.json" if docs else None)
     app.mount("/static", StaticFiles(directory=STATIC), name="static")
     throttle = LoginThrottle()
+    watch = None
+    if people is not None:
+        from .tailgate import WatchManager
+        watch = WatchManager(store, people, hub.publish, stamp_photo)
+    enrolment = None
+    if faces is not None and live is not None:
+        from .liveness import EnrolmentService
+        enrolment = EnrolmentService(faces, live)
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next):
@@ -413,6 +427,8 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
                 "photo_retention_days": int(store.setting("photo_retention_days", "90")),
                 "rekey_days": int(store.setting("rekey_days", "30")),
                 "require_admin_mfa": store.setting("require_admin_mfa") == "1",
+                "tailgate_detection": store.setting("tailgate_detection", "1") == "1",
+                "tailgate_available": watch is not None,
                 "last_backup": float(store.setting("last_backup") or 0) or None,
                 "controller_token_hint": store.secrets.controller_token[:6] + "...",
                 "tls_fingerprint": getattr(app.state, "tls_fingerprint", None)}
@@ -843,6 +859,53 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
             raise HTTPException(404, "that event has no photo")
         return enrol_face(cid, (store.data_dir / "photos" / r["photo"]).read_bytes(), f"event #{seq}", op)
 
+    @app.post("/api/cardholders/{cid}/faces/enrolment")
+    def start_enrolment(cid: int, op: dict = Depends(admin)) -> dict:
+        """Guided enrolment: the server sets the steps, judges every frame and
+        enrols only a live face that completed them all."""
+        if enrolment is None:
+            raise HTTPException(503, "guided enrolment unavailable: face or anti-spoofing models are not installed")
+        if store.q1("SELECT 1 FROM cardholders WHERE id=?", (cid,)) is None:
+            raise HTTPException(404, "no such cardholder")
+        return enrolment.start(cid, op["username"]).view()
+
+    def save_enrolment(e: Any, op: dict) -> None:
+        from .liveness import REAL_MIN, EnrolmentService
+        embs = EnrolmentService.chosen_templates(e)
+        other, score = need_faces().best_match(embs[0], [t for t in templates() if t[0] != e.cardholder_id])
+        if other is not None:
+            e.state, e.message = "failed", "This face already matches another cardholder."
+            journal(op, "cardholder.face_enrol_refused", f"live enrolment refused: face matches cardholder {other} "
+                    f"({score:.2f})", cardholder_id=e.cardholder_id)
+            return
+        for emb in embs:
+            store.x("INSERT INTO face_templates(cardholder_id, embedding, source, created) VALUES(?, ?, ?, ?)",
+                    (e.cardholder_id, emb.tobytes(), "live enrolment", time.time()))
+        live_scores = [s for s in e.real_scores if s >= REAL_MIN]
+        journal(op, "cardholder.face_enrolled",
+                f"guided enrolment with liveness: {len(embs)} templates, steps {' > '.join(e.steps)}, "
+                f"{e.frames} frames, lowest live score {min(live_scores):.2f}", cardholder_id=e.cardholder_id)
+        e.state, e.message = "saved", f"Face enrolled ({len(embs)} templates)"
+
+    @app.post("/api/faces/enrolment/{sid}/frame")
+    async def enrolment_frame(sid: str, request: Request, op: dict = Depends(admin)) -> dict:
+        from starlette.concurrency import run_in_threadpool
+        e = enrolment.get(sid) if enrolment is not None else None
+        if e is None or e.operator != op["username"]:
+            raise HTTPException(404, "no such enrolment session")
+        body = await request.body()
+        if not 0 < len(body) <= 2_000_000:
+            raise HTTPException(413, "frame too large")
+        check_image(body)
+        await run_in_threadpool(enrolment.frame, e, body)
+        if e.state == "done":
+            await run_in_threadpool(save_enrolment, e, op)
+        elif e.state == "failed" and not e.logged:
+            e.logged = True
+            journal(op, "cardholder.face_enrol_failed", f"live enrolment failed: {e.message}",
+                    cardholder_id=e.cardholder_id)
+        return e.view()
+
     @app.delete("/api/cardholders/{cid}/faces")
     def clear_faces(cid: int, op: dict = Depends(admin)) -> dict:
         store.x("DELETE FROM face_templates WHERE cardholder_id=?", (cid,))
@@ -1075,7 +1138,83 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
                            detail=f"entry photo for event #{ev['seq']} sha256={digest.hex()}", req_ctr=req)
         hub.publish({"type": "photo", "seq": ev["seq"]})
         hub.publish({"type": "event", "event": pj})
+        if faces is not None and ev["kind"] == "access.granted" and ev["cardholder_id"] is not None:
+            import threading
+            threading.Thread(target=check_identity, args=(dict(ev), body, link.name), daemon=True).start()
         return {"ok": True, "event": ev["seq"]}
+
+    def check_identity(ev: dict, jpeg: bytes, door: str) -> None:
+        """On a PIN grant, compare the face in the entry photo with the faces
+        enrolled for that PIN's owner. A clear face that is plainly someone
+        else suggests a shared or stolen PIN. Unclear photos are not evidence,
+        so they never raise anything."""
+        import logging
+        from .faces import FaceError
+        own = [t for t in templates() if t[0] == ev["cardholder_id"]]
+        if not own:
+            return
+        try:
+            r = faces.analyse(jpeg)
+        except FaceError:
+            return
+        except Exception:
+            logging.getLogger("lintel.faces").exception("identity check failed for event #%d", ev["seq"])
+            return
+        if r.detect_score < IDENTITY_MIN_DETECT:
+            return
+        _, score = faces.best_match(r.embedding, own)
+        if score >= IDENTITY_MISMATCH_BELOW:
+            return
+        who = store.q1("SELECT first_name || ' ' || last_name n FROM cardholders WHERE id=?", (ev["cardholder_id"],))
+        name = who["n"] if who else f"cardholder {ev['cardholder_id']}"
+        mj = store.journal("access.face_mismatch", door_id=ev["door_id"], cardholder_id=ev["cardholder_id"],
+                           req_ctr=ev["req_ctr"],
+                           detail=f"face at {door} does not match {name}'s enrolled face (similarity {score:.2f}) "
+                                  f"for event #{ev['seq']}: PIN may be shared or stolen")
+        al = store.raise_alarm(3, "access.face_mismatch", f"{name}'s PIN used by someone else at {door}",
+                               door_id=ev["door_id"], event_seq=ev["seq"])
+        hub.publish({"type": "event", "event": mj})
+        hub.publish({"type": "alarm", "alarm": al})
+
+    @app.post("/api/door/{door_id}/watch", dependencies=[Depends(controller_auth)])
+    async def upload_watch(door_id: int, request: Request) -> dict:
+        """One frame of the burst a panel records while its door is open after a
+        grant, for tailgating detection. Signed like entry photos, with the
+        frame's index, the burst length and its capture time inside the
+        signature, so a relaying controller cannot add, drop or reorder frames."""
+        from .tailgate import MAX_FRAME_MS, MAX_FRAMES
+        link = ctl.doors.get(door_id)
+        if link is None:
+            raise HTTPException(404, "unknown door")
+        body = await request.body()
+        if not 0 < len(body) <= 2_000_000:
+            raise HTTPException(413, "frame too large")
+        try:
+            req = int(request.headers["x-lintel-req"])
+            index, total = (int(v) for v in request.headers["x-lintel-frame"].split("/"))
+            ms = int(request.headers["x-lintel-ms"])
+            mac = bytes.fromhex(request.headers["x-lintel-mac"])
+        except (KeyError, ValueError):
+            raise HTTPException(400, "missing signature")
+        if not (0 < total <= MAX_FRAMES and 0 <= index < total and 0 <= ms <= MAX_FRAME_MS):
+            raise HTTPException(400, "frame index or time out of range")
+        want = hmac.new(photo_key(link.key), f"watch:{door_id}:{req}:{index}:{total}:{ms}:".encode()
+                        + hashlib.sha256(body).digest(), hashlib.sha256).digest()
+        if not hmac.compare_digest(mac, want):
+            store.journal("photo.rejected", door_id=door_id, detail="door frame with a bad signature")
+            raise HTTPException(403, "bad signature")
+        check_image(body)
+        ev = store.q1("SELECT * FROM events WHERE door_id=? AND req_ctr=? AND kind='access.granted' "
+                      "ORDER BY seq DESC LIMIT 1", (door_id, req))
+        if ev is None or time.time() - ev["ts"] > 120:
+            raise HTTPException(409, "no grant awaiting door frames")
+        if store.setting("tailgate_detection", "1") != "1":
+            return {"ok": True, "analysed": False, "why": "tailgating detection is turned off"}
+        if watch is None:
+            raise HTTPException(503, "tailgating detection unavailable: the person model is not installed")
+        if not watch.add_frame(door_id, link.name, dict(ev), req, index, total, ms, body):
+            raise HTTPException(409, "frame already received")
+        return {"ok": True, "analysed": True}
 
     @app.post("/api/doors/{door_id}/command")
     def door_command(door_id: int, body: CommandIn, op: dict = Depends(operator)) -> dict:

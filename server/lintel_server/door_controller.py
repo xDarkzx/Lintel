@@ -50,7 +50,10 @@ ANNOUNCE = 0x89
 MEDIA_START = 0x8A  # u8 kind (1 screenshot, 2 test photo), u32 ref, u32 size, mac[32]
 MEDIA_CHUNK = 0x8B
 MEDIA_END = 0x8C
-MEDIA_KINDS = {1: "screenshot", 2: "test_photo"}
+MEDIA_KINDS = {1: "screenshot", 2: "test_photo", 3: "face"}
+WATCH_START = 0x8D  # u32 req, u8 index, u8 total, u32 ms, u32 size, mac[32]: one frame of the open-door burst
+WATCH_CHUNK = 0x8E
+WATCH_END = 0x8F
 
 MAX_PAYLOAD = 1024
 MAX_PHOTO = 2_000_000
@@ -131,6 +134,7 @@ class DoorController:
         self.stats = {"up": 0, "down": 0, "photos": 0}
         self.name = socket.gethostname()
         self.media: dict | None = None
+        self.watch: dict | None = None
         self.local_media = Path("panel_media")
 
     # ---- panel side -----------------------------------------------------------
@@ -162,10 +166,30 @@ class DoorController:
             self.media["data"] += p
         elif ptype == MEDIA_END and self.media is not None:
             m, self.media = self.media, None
-            if len(m["data"]) == m["size"]:
+            if len(m["data"]) == m["size"] and m["kind"] == "face":
+                # Uploaded before reading on: the request that cites this face
+                # is the panel's next packet and must not overtake it.
+                self.upload_face(m)
+            elif len(m["data"]) == m["size"]:
                 threading.Thread(target=self.upload_media, args=(m,), daemon=True).start()
             else:
                 log.warning("%s truncated, dropped", m["kind"])
+        elif ptype == WATCH_START and len(p) == 46:
+            req, index, total, ms, size = struct.unpack_from("<IBBII", p)
+            if size <= MAX_PHOTO:
+                self.watch = {"req": req, "index": index, "total": total, "ms": ms, "size": size,
+                              "mac": p[14:46].hex(), "data": bytearray()}
+        elif ptype == WATCH_CHUNK and self.watch is not None:
+            self.watch["data"] += p
+            if len(self.watch["data"]) > self.watch["size"]:
+                log.warning("door frame overran its declared size, dropped")
+                self.watch = None
+        elif ptype == WATCH_END and self.watch is not None:
+            w, self.watch = self.watch, None
+            if len(w["data"]) == w["size"]:
+                threading.Thread(target=self.upload_watch, args=(w,), daemon=True).start()
+            else:
+                log.warning("door frame truncated (%d of %d bytes), dropped", len(w["data"]), w["size"])
         elif ptype == PHOTO_START and len(p) == 40:
             req, size = struct.unpack_from("<II", p)
             if size <= MAX_PHOTO:
@@ -256,6 +280,40 @@ class DoorController:
                 log.error("server refused photo: %s %s", status, raw.decode(errors="replace"))
         except (OSError, ssl.SSLError) as e:
             log.error("photo upload failed: %s", e)
+
+    def upload_face(self, m: dict) -> None:
+        """A face + PIN door's face image. The server holds its verdict for the
+        request that follows; this box only learns whether a face was usable."""
+        if self.door_id is None:
+            log.warning("face image before HELLO, door id unknown; dropped")
+            return
+        try:
+            status, raw = self.post(f"/api/door/{self.door_id}/face", bytes(m["data"]),
+                                    {"Content-Type": "image/jpeg", "X-Lintel-Req": str(m["req"]),
+                                     "X-Lintel-Mac": m["mac"]})
+            if status == 200:
+                log.info("face image delivered: %s", raw.decode(errors="replace"))
+            else:
+                log.error("face image refused: %s %s", status, raw.decode(errors="replace"))
+        except (OSError, ssl.SSLError) as e:
+            log.error("face image upload failed: %s", e)
+
+    def upload_watch(self, w: dict) -> None:
+        if self.door_id is None:
+            log.warning("door frame before HELLO, door id unknown; dropped")
+            return
+        try:
+            status, raw = self.post(f"/api/door/{self.door_id}/watch", bytes(w["data"]),
+                                    {"Content-Type": "image/jpeg", "X-Lintel-Req": str(w["req"]),
+                                     "X-Lintel-Frame": f"{w['index']}/{w['total']}", "X-Lintel-Ms": str(w["ms"]),
+                                     "X-Lintel-Mac": w["mac"]})
+            if status != 200:
+                log.error("door frame %d/%d refused: %s %s", w["index"] + 1, w["total"], status,
+                          raw.decode(errors="replace"))
+            elif w["index"] + 1 == w["total"]:
+                log.info("door frames for request %d delivered", w["req"])
+        except (OSError, ssl.SSLError) as e:
+            log.error("door frame upload failed: %s", e)
 
     # ---- loops ---------------------------------------------------------------------
 

@@ -34,7 +34,8 @@ REASON_TEXT = {
     Reason.LOCKDOWN: "site lockdown", Reason.LOCKED_OUT: "keypad locked out",
     Reason.UNKNOWN_CARD: "card not recognised", Reason.NO_MATCH: "face not recognised",
     Reason.MISMATCH: "credentials belong to different people", Reason.WRONG_MODE: "credential not accepted here",
-    Reason.ENROLLED: "card enrolled",
+    Reason.ENROLLED: "card enrolled", Reason.NO_FACE: "no face seen by the camera",
+    Reason.FACE_NOT_ENROLLED: "no face enrolled for this person",
 }
 FACE_RESULT_TTL_S = 30
 
@@ -174,14 +175,16 @@ class Controller:
         if req.face_ref:
             got = self.face_results.pop((d.id, req.face_ref), None)
             if got is None or now - got[2] > FACE_RESULT_TTL_S:
-                face = (None, 0.0)  # no fresh, signed face image behind this reference
+                face = (None, 0.0, "no_face")  # no fresh, signed face image behind this reference
             else:
-                face = (got[0], got[1])
+                face = (got[0], got[1], "no_face" if got[4] else None)
                 face_jpeg = got[3]
         v = self.engine.decide(d.id, pin=req.pin or None, card=req.uid or None, face=face, now=now,
                                enforce_mode=True)
         if face is not None:
-            v.method = f"face {face[1]:.2f}" + (" + PIN" if req.pin else "")
+            # The similarity is only meaningful when a face was compared with enrolled ones.
+            scored = face[2] is None and face[1] >= 0
+            v.method = (f"face {face[1]:.2f}" if scored else "face") + (" + PIN" if req.pin else "")
         self._decided(d, h, v, addr, now, face_jpeg)
 
     def _on_pin(self, d: DoorLink, h: Header, req: PinReq, addr: tuple[str, int], now: float) -> None:

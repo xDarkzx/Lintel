@@ -39,6 +39,9 @@ class FaceResult:
     embedding: np.ndarray  # unit-length float32[128]
     box: tuple[int, int, int, int]
     detect_score: float
+    # Five points in image pixels: right eye, left eye, nose tip, right and
+    # left mouth corners (YuNet's order; "right" is the person's right).
+    landmarks: np.ndarray | None = None
 
 
 class FaceEngine:
@@ -81,7 +84,7 @@ class FaceEngine:
             feat = self._rec.feature(aligned).flatten().astype(np.float32)
         feat /= np.linalg.norm(feat) + 1e-9
         x, y, fw, fh = (int(v) for v in best[:4])
-        return FaceResult(feat, (x, y, fw, fh), float(best[14]))
+        return FaceResult(feat, (x, y, fw, fh), float(best[14]), best[4:14].reshape(5, 2).astype(np.float32))
 
     @staticmethod
     def best_match(probe: np.ndarray, templates: list[tuple[int, np.ndarray]]) -> tuple[int | None, float]:
