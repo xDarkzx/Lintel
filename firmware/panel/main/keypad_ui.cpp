@@ -402,6 +402,58 @@ void build_overlay(lv_obj_t* scr) {
     lv_obj_add_flag(s_overlay, LV_OBJ_FLAG_HIDDEN);
 }
 
+lv_obj_t* s_adopt = nullptr;
+lv_obj_t* s_adopt_code = nullptr;
+lv_obj_t* s_adopt_serial = nullptr;
+lv_obj_t* s_adopt_link = nullptr;
+
+void build_adoption(lv_obj_t* scr) {
+    s_adopt = lv_obj_create(scr);
+    lv_obj_remove_style_all(s_adopt);
+    lv_obj_set_size(s_adopt, kW, kH);
+    lv_obj_set_style_bg_color(s_adopt, lv_color_hex(kGlow), 0);
+    lv_obj_set_style_bg_grad_color(s_adopt, lv_color_hex(kBg), 0);
+    lv_obj_set_style_bg_grad_dir(s_adopt, LV_GRAD_DIR_VER, 0);
+    lv_obj_set_style_bg_opa(s_adopt, LV_OPA_COVER, 0);
+    lv_obj_add_flag(s_adopt, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(s_adopt, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t* brand = label(s_adopt, &lv_font_montserrat_20, kAccentHi, "LINTEL");
+    lv_obj_set_style_text_letter_space(brand, 6, 0);
+    lv_obj_align(brand, LV_ALIGN_TOP_MID, 0, 60);
+
+    lv_obj_t* t = label(s_adopt, &lv_font_montserrat_32, kText, "Awaiting adoption");
+    lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 150);
+    lv_obj_t* sub = label(s_adopt, &lv_font_montserrat_16, kMuted,
+                          "In the Lintel dashboard open Doors,\nchoose this device and enter the code:");
+    lv_obj_set_style_text_align(sub, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(sub, LV_ALIGN_TOP_MID, 0, 206);
+
+    lv_obj_t* card = lv_obj_create(s_adopt);
+    lv_obj_remove_style_all(card);
+    lv_obj_set_size(card, 380, 150);
+    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 290);
+    lv_obj_set_style_radius(card, 22, 0);
+    lv_obj_set_style_bg_color(card, lv_color_hex(kKey), 0);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(card, lv_color_hex(kAccent), 0);
+    lv_obj_set_style_border_width(card, 2, 0);
+    s_adopt_code = label(card, &lv_font_montserrat_48, kText, "--- ---");
+    lv_obj_set_style_text_letter_space(s_adopt_code, 8, 0);
+    lv_obj_center(s_adopt_code);
+
+    s_adopt_serial = label(s_adopt, &lv_font_montserrat_20, kText, "");
+    lv_obj_align(s_adopt_serial, LV_ALIGN_TOP_MID, 0, 480);
+    s_adopt_link = label(s_adopt, &lv_font_montserrat_16, kAmber, "");
+    lv_obj_align(s_adopt_link, LV_ALIGN_TOP_MID, 0, 520);
+
+    lv_obj_t* foot = label(s_adopt, &lv_font_montserrat_14, kFaint,
+                           "The door key is sent to this panel encrypted\nto its own key pair after you confirm the code.");
+    lv_obj_set_style_text_align(foot, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(foot, LV_ALIGN_BOTTOM_MID, 0, -40);
+    lv_obj_add_flag(s_adopt, LV_OBJ_FLAG_HIDDEN);
+}
+
 void lockout_tick(lv_timer_t* t) {
     if (s_lockout_left > 0) --s_lockout_left;
     char buf[64];
@@ -452,6 +504,7 @@ void ui_begin(const char* door_name, SubmitFn on_submit, void* ctx) {
     build_entry(scr);
     build_keypad(scr);
     build_overlay(scr);
+    build_adoption(scr);
 
     s_idle_timer = lv_timer_create(idle_cb, kIdleClearMs, nullptr);
     lv_timer_create(clock_cb, 1000, nullptr);
@@ -501,6 +554,27 @@ void ui_show_denied(const char* title, const char* detail) {
     bsp_display_lock(0);
     shake_dots();
     show_overlay(kRed, LV_SYMBOL_CLOSE, title, detail, 2400, false);
+    bsp_display_unlock();
+}
+
+void ui_show_adoption(const char* serial, uint32_t pairing_code, bool controller) {
+    bsp_display_lock(0);
+    char code[16];
+    std::snprintf(code, sizeof(code), "%03lu %03lu", static_cast<unsigned long>(pairing_code / 1000),
+                  static_cast<unsigned long>(pairing_code % 1000));
+    lv_label_set_text(s_adopt_code, code);
+    lv_label_set_text(s_adopt_serial, serial);
+    lv_label_set_text(s_adopt_link, controller ? LV_SYMBOL_USB "  Door controller connected"
+                                               : LV_SYMBOL_WARNING "  Connect the door controller (USB)");
+    lv_obj_set_style_text_color(s_adopt_link, lv_color_hex(controller ? kGreen : kAmber), 0);
+    lv_obj_clear_flag(s_adopt, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_adopt);
+    bsp_display_unlock();
+}
+
+void ui_show_message(const char* title, const char* detail) {
+    bsp_display_lock(0);
+    show_overlay(kAccent, LV_SYMBOL_REFRESH, title, detail, 60000, false);
     bsp_display_unlock();
 }
 

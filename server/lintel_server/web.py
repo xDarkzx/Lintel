@@ -19,6 +19,7 @@ from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from . import adopt
 from .controller import Controller, photo_key
 from .photos import stamp_photo
 from .protocol import SiteMode
@@ -61,6 +62,8 @@ class DoorPatch(BaseModel):
     name: str | None = None
     area: str | None = None
     unlock_ms: int | None = Field(None, ge=1000, le=30000)
+    credential_mode: str | None = Field(None, pattern="^(pin|card|card_or_pin|card_and_pin)$")
+    groups: list[int] | None = None
 
 
 class CardholderIn(BaseModel):
@@ -108,6 +111,25 @@ class GroupIn(BaseModel):
     name: str = Field(min_length=1)
     schedule_id: int
     doors: list[int] = []
+
+
+class Announce(BaseModel):
+    serial: str = Field(pattern=r"^LNT-[0-9A-F]{12}$")
+    pubkey: str = Field(pattern=r"^[0-9a-f]{64}$")
+    mac: str = ""
+    firmware: str = ""
+    controller: str = ""
+    door: int = 0
+    seq: int = 0  # sequence number of the last assignment the panel applied
+
+
+class AdoptIn(BaseModel):
+    pairing_code: str = Field(pattern=r"^\d{6}$")
+    door_id: int = Field(ge=1, le=31)
+    name: str = Field("", max_length=40)
+    area: str = ""
+    unlock_ms: int = Field(5000, ge=1000, le=30000)
+    groups: list[int] = []
 
 
 class AlarmAction(BaseModel):
@@ -183,7 +205,9 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int) -> FastAP
 
     def door_rows() -> list[dict]:
         out = []
-        for r in store.q("SELECT id, name, area, unlock_ms, last_seen, last_ip, rssi FROM doors ORDER BY id"):
+        for r in store.q("SELECT d.id, d.name, d.area, d.unlock_ms, d.credential_mode, d.last_seen, d.last_ip, "
+                         "d.rssi, v.serial, v.mac, v.firmware, v.controller, v.adopted_at "
+                         "FROM doors d LEFT JOIN devices v ON v.door_id = d.id ORDER BY d.id"):
             d = dict(r)
             link = ctl.doors.get(d["id"])
             d["online"] = bool(link and link.online)
@@ -237,12 +261,25 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int) -> FastAP
         if store.x("UPDATE doors SET key=?, tx_ceiling=0, rx_highest=0 WHERE id=?", (key, door_id)) == 0:
             raise HTTPException(404, "no such door")
         ctl.load_door(door_id)
-        journal(op, "door.rekeyed", f"door {door_id} key rotated", door_id=door_id)
+        dev = store.q1("SELECT * FROM devices WHERE door_id=?", (door_id,))
+        journal(op, "door.rekeyed", f"door {door_id} key rotated" + (" and sent to the panel" if dev else ""),
+                door_id=door_id)
+        if dev:
+            queue_blob(dev, door_id, key)
+            return {"id": door_id, "auto": True}
         return {"id": door_id, "net_id": f"{store.secrets.net_id:08x}", "key": key.hex(), "udp_port": udp_port}
 
     @app.patch("/api/doors/{door_id}")
     def patch_door(door_id: int, body: DoorPatch, op: dict = Depends(admin)) -> dict:
         fields = body.model_dump(exclude_none=True)
+        groups_ = fields.pop("groups", None)
+        if groups_ is not None:
+            store.x("DELETE FROM access_group_doors WHERE door_id=?", (door_id,))
+            for g in groups_:
+                store.x("INSERT INTO access_group_doors(group_id, door_id) VALUES(?, ?)", (g, door_id))
+            if not fields:
+                journal(op, "door.updated", f"door {door_id} access groups updated", door_id=door_id)
+                return {"ok": True}
         if not fields:
             return {"ok": True}
         sets = ", ".join(f"{k}=?" for k in fields)
@@ -576,6 +613,140 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int) -> FastAP
         if r is None or not r["photo"]:
             raise HTTPException(404, "no photo")
         return FileResponse(store.data_dir / "photos" / r["photo"], media_type="image/jpeg")
+
+    # ---- device adoption ------------------------------------------------------------------------
+
+    def queue_blob(dev: Any, door_id: int, key: bytes) -> None:
+        """Seal a door assignment (or, with door_id 0, an unassignment) to the
+        panel's public key. The controller hands it over on the next announce."""
+        seq = dev["adopt_seq"] + 1
+        blob = adopt.seal(bytes(dev["pubkey"]), door_id, store.secrets.net_id, key, seq)
+        store.x("UPDATE devices SET adopt_seq=?, pending_blob=?, pending_door=? WHERE serial=?",
+                (seq, blob, door_id, dev["serial"]))
+
+    def device_row(r: Any) -> dict:
+        d = dict(r)
+        d["pubkey"] = bytes(d["pubkey"]).hex()
+        d["pending"] = d.pop("pending_blob") is not None
+        d["online"] = time.time() - d["last_seen"] < 20
+        return d
+
+    @app.post("/api/devices/announce")
+    def announce(body: Announce, request: Request) -> dict:
+        """Called by door controllers for every panel they can see. No operator
+        login: announcing only lists a device; adopting it needs an admin and
+        the pairing code from the panel's own screen."""
+        now = time.time()
+        pk = bytes.fromhex(body.pubkey)
+        dev = store.q1("SELECT * FROM devices WHERE serial=?", (body.serial,))
+        controller = body.controller or (request.client.host if request.client else "")
+        if dev is None:
+            if store.q1("SELECT COUNT(*) n FROM devices WHERE door_id IS NULL")["n"] >= 64:
+                raise HTTPException(429, "too many unassigned devices")
+            store.x("INSERT INTO devices(serial, pubkey, mac, firmware, controller, first_seen, last_seen, "
+                    "reported_door) VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+                    (body.serial, pk, body.mac, body.firmware, controller, now, now, body.door))
+            ev = store.journal("device.discovered", detail=f"{body.serial} ({body.mac}) seen via {controller}")
+            hub.publish({"type": "event", "event": ev})
+            hub.publish({"type": "devices"})
+            return {"state": "unassigned"}
+        if bytes(dev["pubkey"]) != pk:
+            if dev["door_id"] is not None:
+                ev = store.journal("device.identity_mismatch", door_id=dev["door_id"],
+                                   detail=f"{body.serial} announced a different key: possible clone or swap")
+                al = store.raise_alarm(1, "device.identity", f"Identity mismatch for {body.serial}",
+                                       door_id=dev["door_id"], event_seq=ev["seq"])
+                hub.publish({"type": "alarm", "alarm": al})
+                raise HTTPException(409, "device identity does not match the adopted key")
+            store.x("UPDATE devices SET pubkey=? WHERE serial=?", (pk, body.serial))
+        store.x("UPDATE devices SET mac=?, firmware=?, controller=?, last_seen=?, reported_door=? WHERE serial=?",
+                (body.mac, body.firmware, controller, now, body.door, body.serial))
+        dev = store.q1("SELECT * FROM devices WHERE serial=?", (body.serial,))
+        if dev["pending_blob"] is not None:
+            if body.seq >= dev["adopt_seq"] and body.door == (dev["pending_door"] or 0):
+                # The panel now reports the assignment we sent: delivered.
+                store.x("UPDATE devices SET pending_blob=NULL, pending_door=NULL WHERE serial=?", (body.serial,))
+                what = f"door {body.door}" if body.door else "unassignment"
+                ev = store.journal("device.provisioned", door_id=body.door or None,
+                                   detail=f"{body.serial} confirmed {what}")
+                hub.publish({"type": "event", "event": ev})
+                hub.publish({"type": "devices"})
+                hub.publish({"type": "doors"})
+            else:
+                return {"state": "provisioning", "provision": bytes(dev["pending_blob"]).hex()}
+        return {"state": "assigned" if dev["door_id"] else "unassigned"}
+
+    @app.get("/api/devices")
+    def devices(op: dict = Depends(viewer)) -> list[dict]:
+        return [device_row(r) for r in store.q("SELECT * FROM devices ORDER BY door_id IS NOT NULL, first_seen DESC")]
+
+    @app.post("/api/devices/{serial}/adopt")
+    def adopt_device(serial: str, body: AdoptIn, op: dict = Depends(admin)) -> dict:
+        dev = store.q1("SELECT * FROM devices WHERE serial=?", (serial,))
+        if dev is None:
+            raise HTTPException(404, "no such device")
+        if dev["door_id"] is not None:
+            raise HTTPException(409, "device is already assigned")
+        if not hmac.compare_digest(adopt.pairing_code(bytes(dev["pubkey"])), body.pairing_code):
+            store.journal("device.adopt_failed", operator=op["username"], detail=f"{serial}: wrong pairing code")
+            raise HTTPException(400, "pairing code does not match the code on the panel")
+        door = store.q1("SELECT * FROM doors WHERE id=?", (body.door_id,))
+        if door is not None and store.q1("SELECT 1 FROM devices WHERE door_id=?", (body.door_id,)):
+            raise HTTPException(409, f"door {body.door_id} already has a device")
+        key = secrets.token_bytes(16)
+        if door is None:
+            store.x("INSERT INTO doors(id, name, area, key, unlock_ms) VALUES(?, ?, ?, ?, ?)",
+                    (body.door_id, body.name or f"Door {body.door_id}", body.area, key, body.unlock_ms))
+        else:
+            store.x("UPDATE doors SET key=?, tx_ceiling=0, rx_highest=0 WHERE id=?", (key, body.door_id))
+        for g in body.groups:
+            store.x("INSERT OR IGNORE INTO access_group_doors(group_id, door_id) VALUES(?, ?)", (g, body.door_id))
+        store.x("UPDATE devices SET door_id=?, adopted_at=? WHERE serial=?", (body.door_id, time.time(), serial))
+        queue_blob(store.q1("SELECT * FROM devices WHERE serial=?", (serial,)), body.door_id, key)
+        ctl.load_door(body.door_id)
+        journal(op, "device.adopted", f"{serial} adopted as door {body.door_id}", door_id=body.door_id)
+        hub.publish({"type": "devices"})
+        hub.publish({"type": "doors"})
+        return {"ok": True, "door_id": body.door_id}
+
+    @app.post("/api/doors/{door_id}/unassign")
+    def unassign(door_id: int, op: dict = Depends(admin)) -> dict:
+        dev = store.q1("SELECT * FROM devices WHERE door_id=?", (door_id,))
+        if dev is None:
+            raise HTTPException(404, "no device on this door")
+        # Rotate the door key so the detached panel's old key is worthless,
+        # and tell the panel to forget its assignment.
+        store.x("UPDATE doors SET key=?, tx_ceiling=0, rx_highest=0 WHERE id=?", (secrets.token_bytes(16), door_id))
+        store.x("UPDATE devices SET door_id=NULL, adopted_at=NULL WHERE serial=?", (dev["serial"],))
+        queue_blob(store.q1("SELECT * FROM devices WHERE serial=?", (dev["serial"],)), 0, bytes(16))
+        ctl.load_door(door_id)
+        journal(op, "device.unassigned", f"{dev['serial']} detached from door {door_id}", door_id=door_id)
+        hub.publish({"type": "devices"})
+        hub.publish({"type": "doors"})
+        return {"ok": True}
+
+    @app.delete("/api/devices/{serial}")
+    def forget_device(serial: str, op: dict = Depends(admin)) -> dict:
+        if store.q1("SELECT 1 FROM devices WHERE serial=? AND door_id IS NOT NULL", (serial,)):
+            raise HTTPException(409, "unassign the device from its door first")
+        store.x("DELETE FROM devices WHERE serial=?", (serial,))
+        journal(op, "device.forgotten", f"{serial} removed from the inventory")
+        hub.publish({"type": "devices"})
+        return {"ok": True}
+
+    @app.get("/api/doors/{door_id}")
+    def door_detail(door_id: int, op: dict = Depends(viewer)) -> dict:
+        row = next((d for d in door_rows() if d["id"] == door_id), None)
+        if row is None:
+            raise HTTPException(404, "no such door")
+        row["groups"] = [dict(g) for g in store.q(
+            "SELECT g.id, g.name, s.name schedule FROM access_group_doors gd JOIN access_groups g ON g.id = gd.group_id "
+            "JOIN schedules s ON s.id = g.schedule_id WHERE gd.door_id=? ORDER BY g.name", (door_id,))]
+        row["recent"] = event_query(15, None, door_id, None, None, None, None)
+        midnight = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        row["today"] = {r["kind"]: r["n"] for r in store.q(
+            "SELECT kind, COUNT(*) n FROM events WHERE door_id=? AND ts>=? GROUP BY kind", (door_id, midnight))}
+        return row
 
     # ---- live updates & page -----------------------------------------------------------------------------
 

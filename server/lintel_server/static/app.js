@@ -127,7 +127,8 @@ function onLive(msg) {
     if (msg.alarm.priority === 1) { toast("CRITICAL: " + msg.alarm.title, true); beep(); }
   }
   if (msg.type === "alarm" || msg.type === "alarms") { refreshAlarmBadge(); if ($("#alarm-list")) loadAlarms(); }
-  if (msg.type === "doors") { refreshKpis(); if (current === "doors") render(); }
+  if (msg.type === "doors" || msg.type === "devices") { refreshKpis(); if (current === "doors" && $("#drawer").classList.contains("hidden")) render(); }
+  if (msg.type === "devices" && current !== "doors" && isAdmin()) api("/api/devices").then((ds) => { const n = ds.filter((d) => d.door_id == null).length; if (n) toast(`${n} unassigned device${n > 1 ? "s" : ""} waiting — see Doors`); });
   if (msg.type === "mode") setModeUi(msg.mode);
 }
 
@@ -421,49 +422,163 @@ PAGES.schedules = async (el) => {
   $$("tr.click", el).forEach((tr) => tr.addEventListener("click", () => form(schedules.find((s) => s.id == tr.dataset.id))));
 };
 
-// --- doors
+// --- doors & devices
+const MODE_LABEL = { pin: "PIN only", card: "Card only", card_or_pin: "Card or PIN", card_and_pin: "Card + PIN" };
+
+function kv(label, value, mono = false) {
+  return `<div class="kv"><span>${label}</span><b class="${mono ? "mono" : ""}">${value ?? "—"}</b></div>`;
+}
+
 function provisionPanel(r, name) {
-  openDrawer(`<h2>Provision ${esc(name)}</h2>
-    <p class="muted">This key is shown once. Paste the command into the panel's USB console (or run the provisioning tool).</p>
-    <div class="secret mono">prov ${r.id} ${r.net_id} ${r.key} ${location.hostname} ${r.udp_port}</div>
-    <p class="hint">If the server runs in Docker, use this computer's LAN address instead of ${esc(location.hostname)} when it is "localhost".</p>
+  openDrawer(`<h2>Manual provisioning — ${esc(name)}</h2>
+    <p class="muted">This door has no adopted device, so the key is shown once for manual setup on the panel's USB console.
+    Panels connected through a door controller are adopted instead and never need this.</p>
+    <div class="secret mono">prov ${r.id} ${r.net_id} ${r.key}</div>
     <div class="form-actions"><span></span><button class="btn primary" onclick="closeDrawer()">Done</button></div>`);
 }
 
 PAGES.doors = async (el) => {
-  const doors = await api("/api/doors");
-  el.innerHTML = `<div class="toolbar"><span class="grow muted">Each door has its own AES-128 key. Frames from any other key are rejected and alarmed.</span>
-    ${isAdmin() ? `<button id="add" class="btn primary">+ Add door</button>` : ""}</div>
-    <div class="grid doors">${doors.map((d) => `${doorTile(d).replace('<div class="card door">', `<div class="card door" data-id="${d.id}">`).replace(/<\/div>$/, "")}
-      ${isAdmin() ? `<div class="checks"><button class="btn small" data-edit="${d.id}">Edit</button><button class="btn small" data-rekey="${d.id}">Rotate key</button><button class="btn small danger" data-del="${d.id}">Remove</button></div>` : ""}</div>`).join("") || `<div class="empty">No doors yet</div>`}</div>`;
-  const form = (d) => {
-    openDrawer(`<h2>${d ? "Edit " + esc(d.name) : "Add door"}</h2><form class="form" id="df">
-      <div class="row"><label>Door number (1–31)<input name="id" type="number" min="1" max="31" required value="${d?.id ?? (doors.length ? Math.max(...doors.map((x) => x.id)) + 1 : 1)}" ${d ? "disabled" : ""}></label>
-        <label>Unlock time (ms)<input name="unlock_ms" type="number" min="1000" max="30000" step="500" value="${d?.unlock_ms ?? 5000}"></label></div>
-      <label>Name<input name="name" required value="${esc(d?.name)}" placeholder="Main Entrance"></label>
-      <label>Area / zone<input name="area" value="${esc(d?.area)}" placeholder="Ground floor"></label>
-      <div class="form-actions"><span></span><div><button type="button" class="btn ghost" onclick="closeDrawer()">Cancel</button> <button class="btn primary">Save</button></div></div></form>`);
+  const [doors, devices, groups] = await Promise.all([api("/api/doors"), api("/api/devices"), api("/api/groups")]);
+  const unassigned = devices.filter((d) => d.door_id == null);
+  el.innerHTML = `
+    <div class="card" style="margin-bottom:18px">
+      <div class="card-head"><h2>Unassigned devices</h2><span class="muted">panels announced by door controllers, waiting to be adopted</span></div>
+      ${unassigned.length ? `<table><thead><tr><th>Serial</th><th>MAC</th><th>Firmware</th><th>Controller</th><th>First seen</th><th>Status</th><th></th></tr></thead><tbody>
+        ${unassigned.map((d) => `<tr><td class="mono"><b>${esc(d.serial)}</b></td><td class="mono">${esc(d.mac)}</td><td>${esc(d.firmware)}</td>
+          <td>${esc(d.controller)}</td><td class="muted">${ago(d.first_seen)}</td>
+          <td>${d.online ? `<span class="pill green"><span class="dot green"></span>Online</span>` : `<span class="pill">Last seen ${ago(d.last_seen)}</span>`}</td>
+          <td style="text-align:right">${isAdmin() ? `<button class="btn primary small" data-adopt="${esc(d.serial)}">Adopt</button> <button class="btn small ghost" data-forget="${esc(d.serial)}">Ignore</button>` : ""}</td></tr>`).join("")}
+        </tbody></table>` : `<div class="empty">No unassigned devices. Plug a new keypad into a door controller and it appears here within seconds.</div>`}
+    </div>
+    <div class="toolbar"><span class="grow muted">Each door has its own AES-128 key, delivered to its panel sealed to the panel's own X25519 key.</span>
+      ${isAdmin() ? `<button id="add" class="btn">+ Door without device</button>` : ""}</div>
+    <div class="grid doors">${doors.map((d) => `<div class="card door click-card" data-door="${d.id}">
+      <div class="door-top"><div class="door-name">${esc(d.name)}</div>
+        <span class="pill ${d.online ? "green" : "red"}"><span class="dot ${d.online ? "green" : "red"}"></span>${d.online ? "Online" : "Offline"}</span></div>
+      <div class="door-meta"><span>Door ${d.id}${d.area ? " · " + esc(d.area) : ""}</span><span>${MODE_LABEL[d.credential_mode] || "PIN only"}</span></div>
+      <div class="door-meta"><span class="mono">${d.serial ? esc(d.serial) : "no device"}</span><span>Seen ${ago(d.last_seen)}</span></div>
+      ${d.rejects ? `<div class="door-meta" style="color:var(--red)">${d.rejects} rejected frames</div>` : ""}</div>`).join("") || `<div class="empty">No doors yet — adopt a device above.</div>`}</div>`;
+
+  $$("[data-adopt]").forEach((b) => b.addEventListener("click", () => adoptForm(unassigned.find((d) => d.serial === b.dataset.adopt), doors, groups)));
+  $$("[data-forget]").forEach((b) => b.addEventListener("click", async () => {
+    if (confirm("Ignore this device? It reappears if it announces again.")) { await api(`/api/devices/${b.dataset.forget}`, { method: "DELETE" }); render(); }
+  }));
+  $$("[data-door]").forEach((c) => c.addEventListener("click", () => doorDetail(Number(c.dataset.door), groups)));
+  $("#add")?.addEventListener("click", () => {
+    openDrawer(`<h2>Door without device</h2><p class="muted">Create the door now and adopt a panel into it later, or provision a panel by hand.</p>
+      <form class="form" id="df">
+      <div class="row"><label>Door number (1–31)<input name="id" type="number" min="1" max="31" required value="${doors.length ? Math.max(...doors.map((x) => x.id)) + 1 : 1}"></label>
+        <label>Unlock time (ms)<input name="unlock_ms" type="number" min="1000" max="30000" step="500" value="5000"></label></div>
+      <label>Name<input name="name" required placeholder="Server room"></label>
+      <label>Area / zone<input name="area" placeholder="Level 2"></label>
+      <div class="form-actions"><span></span><div><button type="button" class="btn ghost" onclick="closeDrawer()">Cancel</button> <button class="btn primary">Create</button></div></div></form>`);
     $("#df").addEventListener("submit", async (e) => {
       e.preventDefault();
       const f = new FormData(e.target);
-      const body = { name: f.get("name"), area: f.get("area"), unlock_ms: Number(f.get("unlock_ms")) };
       try {
-        if (d) { await api(`/api/doors/${d.id}`, { method: "PATCH", body }); closeDrawer(); render(); }
-        else { const r = await api("/api/doors", { body: { ...body, id: Number(f.get("id")) } }); provisionPanel(r, body.name); render(); }
+        const r = await api("/api/doors", { body: { id: Number(f.get("id")), name: f.get("name"), area: f.get("area"), unlock_ms: Number(f.get("unlock_ms")) } });
+        provisionPanel(r, f.get("name")); render();
       } catch (err) { toast(err.message, true); }
     });
-  };
-  $("#add")?.addEventListener("click", () => form(null));
-  $$("[data-edit]").forEach((b) => b.addEventListener("click", () => form(doors.find((d) => d.id == b.dataset.edit))));
-  $$("[data-rekey]").forEach((b) => b.addEventListener("click", async () => {
-    if (!confirm("Rotate this door's key? The panel stops working until re-provisioned.")) return;
-    const d = doors.find((x) => x.id == b.dataset.rekey);
-    provisionPanel(await api(`/api/doors/${d.id}/rekey`, { method: "POST" }), d.name);
-  }));
-  $$("[data-del]").forEach((b) => b.addEventListener("click", async () => {
-    if (confirm("Remove this door? Its history stays in the journal.")) { await api(`/api/doors/${b.dataset.del}`, { method: "DELETE" }); render(); }
-  }));
+  });
 };
+
+function adoptForm(dev, doors, groups) {
+  const free = doors.filter((d) => !d.serial);
+  const next = doors.length ? Math.max(...doors.map((x) => x.id)) + 1 : 1;
+  openDrawer(`<h2>Adopt ${esc(dev.serial)}</h2>
+    <div class="kvs">${kv("MAC", esc(dev.mac), true)}${kv("Firmware", esc(dev.firmware))}${kv("Controller", esc(dev.controller))}${kv("First seen", fmtDate(dev.first_seen))}</div>
+    <form class="form" id="af" style="margin-top:16px">
+      <label>Pairing code shown on the panel's screen<input name="code" inputmode="numeric" pattern="\\d{3} ?\\d{3}" maxlength="7" required autocomplete="off" placeholder="123 456" style="font-size:22px;letter-spacing:6px"></label>
+      <p class="hint">The code proves you are adopting the device in front of you, not one announced by someone else on the network.</p>
+      <label>Assign to<select name="target">
+        <option value="new">New door #${next}</option>
+        ${free.map((d) => `<option value="${d.id}">Existing: ${esc(d.name)} (door ${d.id})</option>`).join("")}</select></label>
+      <div id="newdoor" class="form">
+        <div class="row"><label>Name<input name="name" placeholder="Main Entrance"></label><label>Area / zone<input name="area" placeholder="Ground floor"></label></div>
+        <label>Unlock time (ms)<input name="unlock_ms" type="number" min="1000" max="30000" step="500" value="5000"></label>
+      </div>
+      <label>Add to access groups<div class="checks">${groups.map((g) => `<label><input type="checkbox" name="groups" value="${g.id}">${esc(g.name)}</label>`).join("") || `<span class="hint">No access groups yet</span>`}</div></label>
+      <div class="form-actions"><span></span><div><button type="button" class="btn ghost" onclick="closeDrawer()">Cancel</button> <button class="btn primary">Adopt device</button></div></div>
+    </form>`);
+  const sel = $("#af select[name=target]");
+  sel.addEventListener("change", () => $("#newdoor").classList.toggle("hidden", sel.value !== "new"));
+  $("#af").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const f = new FormData(e.target);
+    const body = {
+      pairing_code: f.get("code").replace(/\s/g, ""),
+      door_id: sel.value === "new" ? next : Number(sel.value),
+      name: f.get("name") || "", area: f.get("area") || "", unlock_ms: Number(f.get("unlock_ms") || 5000),
+      groups: f.getAll("groups").map(Number),
+    };
+    try {
+      await api(`/api/devices/${dev.serial}/adopt`, { body });
+      closeDrawer(); toast(`Adopted as door ${body.door_id}. The panel restarts with its key in a few seconds.`); render();
+    } catch (err) { toast(err.message, true); }
+  });
+}
+
+async function doorDetail(id, groups) {
+  const d = await api(`/api/doors/${id}`);
+  const ro = !isAdmin();
+  const inGroup = new Set(d.groups.map((g) => g.id));
+  const today = (k) => d.today[k] || 0;
+  openDrawer(`
+    <div class="detail-head"><div><h2 style="margin:0">${esc(d.name)}</h2><div class="muted">Door ${d.id}${d.area ? " · " + esc(d.area) : ""}</div></div>
+      <span class="pill ${d.online ? "green" : "red"}"><span class="dot ${d.online ? "green" : "red"}"></span>${d.online ? "Online" : "Offline"}</span></div>
+
+    <div class="stats3"><div><b style="color:var(--green)">${today("access.granted")}</b><span>granted today</span></div>
+      <div><b style="color:${today("access.denied") ? "var(--amber)" : "inherit"}">${today("access.denied")}</b><span>denied today</span></div>
+      <div><b style="color:${d.rejects ? "var(--red)" : "inherit"}">${d.rejects}</b><span>rejected frames</span></div></div>
+
+    <h3 class="section">Device</h3>
+    ${d.serial ? `<div class="kvs">${kv("Serial", esc(d.serial), true)}${kv("MAC", esc(d.mac), true)}${kv("Firmware", esc(d.firmware))}
+      ${kv("Door controller", esc(d.controller))}${kv("Adopted", d.adopted_at ? fmtDate(d.adopted_at) : "—")}${kv("Last seen", ago(d.last_seen))}</div>`
+      : `<div class="empty" style="padding:16px">No device adopted to this door. Adopt one from Unassigned devices.</div>`}
+
+    <h3 class="section">Settings</h3>
+    <form class="form" id="dd">
+      <div class="row"><label>Name<input name="name" value="${esc(d.name)}" required></label><label>Area / zone<input name="area" value="${esc(d.area)}"></label></div>
+      <div class="row"><label>Unlock time (ms)<input name="unlock_ms" type="number" min="1000" max="30000" step="500" value="${d.unlock_ms}"></label>
+        <label>Credentials accepted<select name="credential_mode">${Object.entries(MODE_LABEL).map(([k, v]) => `<option value="${k}" ${d.credential_mode === k ? "selected" : ""}>${v}</option>`).join("")}</select></label></div>
+      <label>Access groups using this door<div class="checks">${groups.map((g) => `<label><input type="checkbox" name="groups" value="${g.id}" ${inGroup.has(g.id) ? "checked" : ""}>${esc(g.name)}</label>`).join("") || `<span class="hint">No access groups</span>`}</div></label>
+      ${ro ? "" : `<div class="form-actions"><span></span><button class="btn primary">Save changes</button></div>`}
+    </form>
+
+    <h3 class="section">Recent activity</h3>
+    <div class="card" style="margin-bottom:18px">${d.recent.length ? d.recent.map((e) => eventRow(e)).join("") : `<div class="empty">No activity yet</div>`}</div>
+
+    ${ro ? "" : `<h3 class="section">Maintenance</h3><div class="checks">
+      <button class="btn" id="rekey">Rotate door key</button>
+      ${d.serial ? `<button class="btn" id="unassign">Unassign device</button>` : ""}
+      <button class="btn danger" id="remove">Remove door</button></div>
+      <p class="hint">Rotating the key re-delivers it to the panel automatically. Unassigning sends the panel back to "awaiting adoption" and voids its key.</p>`}`);
+  if (ro) $$("#dd input, #dd select").forEach((i) => (i.disabled = true));
+  $("#dd").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const f = new FormData(e.target);
+    try {
+      await api(`/api/doors/${id}`, { method: "PATCH", body: { name: f.get("name"), area: f.get("area"), unlock_ms: Number(f.get("unlock_ms")),
+        credential_mode: f.get("credential_mode"), groups: f.getAll("groups").map(Number) } });
+      toast("Door saved"); closeDrawer(); render();
+    } catch (err) { toast(err.message, true); }
+  });
+  $("#rekey")?.addEventListener("click", async () => {
+    if (!confirm("Rotate this door's key?")) return;
+    const r = await api(`/api/doors/${id}/rekey`, { method: "POST" });
+    if (r.auto) { toast("New key sealed to the panel; it switches over on its next check-in"); closeDrawer(); }
+    else provisionPanel(r, d.name);
+  });
+  $("#unassign")?.addEventListener("click", async () => {
+    if (!confirm(`Unassign ${d.serial} from ${d.name}? The door keeps its settings.`)) return;
+    await api(`/api/doors/${id}/unassign`, { method: "POST" }); closeDrawer(); render();
+  });
+  $("#remove")?.addEventListener("click", async () => {
+    if (d.serial) return toast("Unassign the device first", true);
+    if (confirm("Remove this door? Its history stays in the journal.")) { await api(`/api/doors/${id}`, { method: "DELETE" }); closeDrawer(); render(); }
+  });
+}
 
 // --- operators
 PAGES.operators = async (el) => {

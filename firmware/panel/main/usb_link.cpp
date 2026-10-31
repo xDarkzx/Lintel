@@ -30,9 +30,10 @@ struct RxMsg {
 QueueHandle_t s_rxq = nullptr;
 SemaphoreHandle_t s_tx_mutex = nullptr;
 LinkFrameFn s_on_frame = nullptr;
+LinkFrameFn s_on_provision = nullptr;
 void* s_ctx = nullptr;
 volatile bool s_dtr = false;
-char s_hello[48] = {};
+char s_hello[96] = {};
 
 enum class St { M0, M1, Type, Len0, Len1, Payload, Crc0, Crc1 };
 St s_st = St::M0;
@@ -61,6 +62,8 @@ void send_hello() { usb_link_send(kLinkHello, reinterpret_cast<const uint8_t*>(s
 void dispatch(uint8_t type, const uint8_t* p, uint16_t len) {
     if (type == kLinkFrameDown && s_on_frame != nullptr) {
         s_on_frame(p, len, s_ctx);
+    } else if (type == kLinkProvision && s_on_provision != nullptr) {
+        s_on_provision(p, len, s_ctx);
     } else if (type == kLinkPing) {
         usb_link_send(kLinkPong, nullptr, 0);
         send_hello();
@@ -125,10 +128,11 @@ void rx_task(void*) {
 
 }  // namespace
 
-void usb_link_start(uint16_t door_id, LinkFrameFn on_frame, void* ctx) {
+void usb_link_start(const char* hello, LinkFrameFn on_frame, LinkFrameFn on_provision, void* ctx) {
     s_on_frame = on_frame;
+    s_on_provision = on_provision;
     s_ctx = ctx;
-    std::snprintf(s_hello, sizeof(s_hello), "lintel-panel/1 door=%u", door_id);
+    std::snprintf(s_hello, sizeof(s_hello), "%s", hello);
     s_rxq = xQueueCreate(8, sizeof(RxMsg));
     s_tx_mutex = xSemaphoreCreateMutex();
 

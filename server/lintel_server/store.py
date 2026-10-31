@@ -118,6 +118,22 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS events_ts ON events(ts);
 CREATE INDEX IF NOT EXISTS events_door_ctr ON events(door_id, req_ctr);
 
+CREATE TABLE IF NOT EXISTS devices (
+    serial TEXT PRIMARY KEY,
+    pubkey BLOB NOT NULL,
+    mac TEXT NOT NULL DEFAULT '',
+    firmware TEXT NOT NULL DEFAULT '',
+    controller TEXT NOT NULL DEFAULT '',
+    first_seen REAL NOT NULL,
+    last_seen REAL NOT NULL,
+    door_id INTEGER UNIQUE REFERENCES doors(id) ON DELETE SET NULL,
+    reported_door INTEGER NOT NULL DEFAULT 0,
+    adopted_at REAL,
+    adopt_seq INTEGER NOT NULL DEFAULT 0,
+    pending_blob BLOB,
+    pending_door INTEGER
+);
+
 CREATE TABLE IF NOT EXISTS alarms (
     id INTEGER PRIMARY KEY,
     ts REAL NOT NULL,
@@ -184,6 +200,7 @@ class Store:
         self._db.row_factory = sqlite3.Row
         self._db.executescript(SCHEMA)
         self._lock = threading.RLock()
+        self._migrate()
         self._seed()
 
     # ---- low level ---------------------------------------------------------
@@ -208,6 +225,15 @@ class Store:
     def set_setting(self, key: str, value: str) -> None:
         self.x("INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                (key, value))
+
+    def _migrate(self) -> None:
+        """Additive column changes for databases created by older versions."""
+        for table, column, decl in (("doors", "credential_mode", "TEXT NOT NULL DEFAULT 'pin'"),
+                                    ("cardholders", "card_tag", "BLOB")):
+            cols = {r["name"] for r in self.q(f"PRAGMA table_info({table})")}
+            if column not in cols:
+                self.x(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+        self.x("CREATE UNIQUE INDEX IF NOT EXISTS cardholders_card ON cardholders(card_tag)")
 
     # ---- first run ----------------------------------------------------------
 

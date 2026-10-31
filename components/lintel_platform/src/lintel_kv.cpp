@@ -49,6 +49,11 @@ size_t kv_blob_size(const char* key) {
     return have;
 }
 
+bool kv_erase(const char* key) {
+    esp_err_t e = nvs_erase_key(s_nvs, key);
+    return (e == ESP_OK || e == ESP_ERR_NVS_NOT_FOUND) && nvs_commit(s_nvs) == ESP_OK;
+}
+
 bool kv_erase_all() { return nvs_erase_all(s_nvs) == ESP_OK && nvs_commit(s_nvs) == ESP_OK; }
 
 bool parse_hex(const char* s, uint8_t* out, size_t len) {

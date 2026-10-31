@@ -18,4 +18,8 @@ void ui_show_granted(const char* title, const char* detail, uint32_t unlock_ms);
 void ui_show_denied(const char* title, const char* detail);
 void ui_show_lockout(uint32_t seconds);
 
+// Full-screen "awaiting adoption" view for a panel with no door assignment.
+void ui_show_adoption(const char* serial, uint32_t pairing_code, bool controller);
+void ui_show_message(const char* title, const char* detail);
+
 }  // namespace panel

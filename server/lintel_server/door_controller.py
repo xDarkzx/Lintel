@@ -14,6 +14,7 @@ taking it over gives an attacker nothing they could not already sniff.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import socket
 import struct
@@ -31,6 +32,7 @@ MAGIC = b"\xA5\x5A"
 
 # controller -> panel
 FRAME_DOWN = 0x01
+PROVISION = 0x02
 PING = 0x05
 # panel -> controller
 FRAME_UP = 0x81
@@ -39,6 +41,7 @@ HELLO = 0x85
 PHOTO_START = 0x86
 PHOTO_CHUNK = 0x87
 PHOTO_END = 0x88
+ANNOUNCE = 0x89
 
 MAX_PAYLOAD = 1024
 MAX_PHOTO = 2_000_000
@@ -114,6 +117,7 @@ class DoorController:
         self.door_id: int | None = None
         self.photo: dict | None = None
         self.stats = {"up": 0, "down": 0, "photos": 0}
+        self.name = socket.gethostname()
 
     # ---- panel side -----------------------------------------------------------
 
@@ -129,10 +133,12 @@ class DoorController:
             self.stats["up"] += 1
         elif ptype == HELLO:
             text = p.rstrip(b"\x00").decode(errors="replace")
-            for part in text.split():
-                if part.startswith("door="):
-                    self.door_id = int(part[5:])
-            log.info("panel says hello: %s", text)
+            door = next((int(x[5:]) for x in text.split() if x.startswith("door=")), None)
+            if door != self.door_id or door is None:
+                log.info("panel says hello: %s", text)
+            self.door_id = door or None
+        elif ptype == ANNOUNCE and len(p) > 32:
+            threading.Thread(target=self.announce, args=(p,), daemon=True).start()
         elif ptype == PHOTO_START and len(p) == 40:
             req, size = struct.unpack_from("<II", p)
             if size <= MAX_PHOTO:
@@ -148,6 +154,30 @@ class DoorController:
                 threading.Thread(target=self.upload_photo, args=(ph,), daemon=True).start()
             else:
                 log.warning("photo truncated (%d of %d bytes), dropped", len(ph["data"]), ph["size"])
+
+    def announce(self, p: bytes) -> None:
+        """Pass the panel's identity to the server; hand back a sealed
+        adoption message if the server has one waiting for it."""
+        fields = dict(kv.split("=", 1) for kv in p[32:].decode(errors="replace").split() if "=" in kv)
+        body = {"serial": fields.get("serial", ""), "pubkey": p[:32].hex(), "mac": fields.get("mac", ""),
+                "firmware": fields.get("fw", ""), "controller": self.name,
+                "door": int(fields.get("door", "0")), "seq": int(fields.get("seq", "0"))}
+        req = urllib.request.Request(f"{self.http}/api/devices/announce", data=json.dumps(body).encode(),
+                                     method="POST", headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                reply = json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            log.error("server refused announce from %s: %s %s", body["serial"], e.code, e.read().decode(errors="replace"))
+            return
+        except OSError as e:
+            log.warning("announce failed: %s", e)
+            return
+        if reply.get("provision"):
+            log.info("delivering sealed door assignment to %s", body["serial"])
+            self.send_panel(PROVISION, bytes.fromhex(reply["provision"]))
+        elif reply.get("state") == "unassigned" and body["door"] == 0:
+            log.info("%s is waiting for adoption in the dashboard", body["serial"])
 
     def upload_photo(self, ph: dict) -> None:
         if self.door_id is None:

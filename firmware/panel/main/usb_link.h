@@ -18,6 +18,7 @@ namespace panel {
 
 // controller -> panel
 constexpr uint8_t kLinkFrameDown = 0x01;  // sealed frame from the server
+constexpr uint8_t kLinkProvision = 0x02;  // adoption blob sealed to this panel's key
 constexpr uint8_t kLinkPing = 0x05;
 
 // panel -> controller
@@ -27,10 +28,11 @@ constexpr uint8_t kLinkHello = 0x85;       // cstring, on boot and on host conne
 constexpr uint8_t kLinkPhotoStart = 0x86;  // u32 req_counter, u32 length, u8 mac[32]
 constexpr uint8_t kLinkPhotoChunk = 0x87;  // raw JPEG bytes, in order
 constexpr uint8_t kLinkPhotoEnd = 0x88;
+constexpr uint8_t kLinkAnnounce = 0x89;    // pubkey[32] then "serial=.. mac=.. fw=.. door=N seq=N"
 
 using LinkFrameFn = void (*)(const uint8_t* frame, size_t len, void* ctx);
 
-void usb_link_start(uint16_t door_id, LinkFrameFn on_frame, void* ctx);
+void usb_link_start(const char* hello, LinkFrameFn on_frame, LinkFrameFn on_provision, void* ctx);
 void usb_link_send(uint8_t type, const uint8_t* payload, uint16_t len);
 bool usb_link_host_connected();
 

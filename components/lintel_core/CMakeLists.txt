@@ -1,6 +1,7 @@
 # lintel_core builds two ways: as an ESP-IDF component inside the firmware
 # projects, and as a plain static library for the host test suite.
 set(LINTEL_CORE_SRCS
+    src/adopt.cpp
     src/audit.cpp
     src/controller.cpp
     src/counters.cpp

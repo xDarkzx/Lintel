@@ -13,6 +13,7 @@ bool kv_set_u32(const char* key, uint32_t v);
 bool kv_get_blob(const char* key, void* out, size_t len);  // exact length required
 bool kv_set_blob(const char* key, const void* data, size_t len);
 size_t kv_blob_size(const char* key);
+bool kv_erase(const char* key);
 bool kv_erase_all();
 
 // Parses exactly `len` bytes of hex. Returns false on any other input.

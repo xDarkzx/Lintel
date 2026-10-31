@@ -11,6 +11,7 @@
 #include <sys/time.h>
 
 #include "camera.h"
+#include "identity.h"
 #include "esp_console.h"
 #include "esp_log.h"
 #include "esp_system.h"
@@ -19,6 +20,7 @@
 #include "freertos/queue.h"
 #include "freertos/task.h"
 #include "keypad_ui.h"
+#include "lintel/adopt.h"
 #include "lintel/bytes.h"
 #include "lintel/counters.h"
 #include "lintel/crypto.h"
@@ -41,6 +43,7 @@ constexpr uint32_t kAckTimeoutMs = 1500;
 constexpr uint32_t kHeartbeatMs = 5000;
 constexpr int kMissedForOffline = 2;
 constexpr uint16_t kPhotoChunk = 1000;
+constexpr const char* kFirmware = "0.3.0";
 
 struct Config {
     uint16_t door_id;
@@ -49,6 +52,9 @@ struct Config {
 };
 
 Config s_cfg = {};
+Identity s_id = {};
+bool s_provisioned = false;
+uint32_t s_adopt_seq = 0;
 QueueHandle_t s_pin_q = nullptr;
 QueueHandle_t s_down_q = nullptr;  // sealed frames arriving from the controller
 
@@ -118,6 +124,58 @@ bool await_reply(MsgType type, uint32_t ctr, uint8_t* pt, size_t& len, uint32_t 
         s_rx.commit(h.counter);
         if (h.type == type && len >= off + 4 && get_u32(pt + off) == ctr) return true;
     }
+}
+
+// ---- adoption ---------------------------------------------------------------------
+
+// Tells the controller who we are; it forwards this to the server, which
+// lists us as an unassigned device until an operator adopts us.
+void announce_task(void*) {
+    for (;;) {
+        if (usb_link_host_connected()) {
+            uint8_t buf[lintel::kX25519Len + 120];
+            std::memcpy(buf, s_id.pk, lintel::kX25519Len);
+            int n = std::snprintf(reinterpret_cast<char*>(buf) + lintel::kX25519Len, 120,
+                                  "serial=%s mac=%s fw=%s door=%u seq=%lu", s_id.serial, s_id.mac, kFirmware,
+                                  s_provisioned ? s_cfg.door_id : 0, static_cast<unsigned long>(s_adopt_seq));
+            usb_link_send(kLinkAnnounce, buf, static_cast<uint16_t>(lintel::kX25519Len + n));
+        }
+        if (!s_provisioned) ui_show_adoption(s_id.serial, s_id.pairing_code, usb_link_host_connected());
+        vTaskDelay(pdMS_TO_TICKS(s_provisioned ? 15000 : 3000));
+    }
+}
+
+// A door assignment sealed to our public key. Only this panel can open it,
+// so the controller that carried it learns nothing.
+void on_provision(const uint8_t* blob, size_t len, void*) {
+    lintel::AdoptPayload a{};
+    if (!lintel::adopt_open(s_id.sk, s_id.pk, blob, len, a)) {
+        ESP_LOGW(TAG, "adoption message failed authentication, ignored");
+        return;
+    }
+    if (a.seq <= s_adopt_seq) {
+        ESP_LOGW(TAG, "stale adoption message (seq %lu), ignored", static_cast<unsigned long>(a.seq));
+        return;
+    }
+    bool ok;
+    if (a.door_id == 0) {
+        ok = kv_erase("door_id") && kv_erase("net_id") && kv_erase("k_door");
+        ESP_LOGI(TAG, "unassigned by the server");
+        ui_show_message("Unassigned", "This panel was removed from its door.\nRestarting...");
+    } else {
+        ok = kv_set_u32("door_id", a.door_id) && kv_set_u32("net_id", a.net_id) &&
+             kv_set_blob("k_door", a.key.b, kKeyLen);
+        ESP_LOGI(TAG, "adopted as door %u", a.door_id);
+        ui_show_message("Adopted", "Door key received.\nRestarting...");
+    }
+    ok = ok && kv_set_u32("tx_ceil", 0) && kv_set_u32("adopt_seq", a.seq);
+    secure_zero(&a, sizeof(a));
+    if (!ok) {
+        ESP_LOGE(TAG, "could not store adoption");
+        return;
+    }
+    vTaskDelay(pdMS_TO_TICKS(1500));
+    esp_restart();
 }
 
 // ---- entry photo -----------------------------------------------------------------
@@ -320,23 +378,30 @@ extern "C" void app_main(void) {
     lintel::kv_init();
     setenv("TZ", "NZST-12NZDT,M9.5.0,M4.1.0/3", 1);  // New Zealand, with daylight saving
     tzset();
-    bool provisioned = load_config(s_cfg);
+    s_provisioned = load_config(s_cfg);
+    lintel::kv_get_u32("adopt_seq", s_adopt_seq);
+    if (!identity_load(s_id)) ESP_LOGE(TAG, "device identity unavailable");
 
     ui_begin(CONFIG_PANEL_DOOR_NAME, on_submit, nullptr);
     ui_set_link(false, false, 0);
     console_begin();
 
-    if (!provisioned) {
-        ESP_LOGW(TAG, "not provisioned: run `prov` on the USB console");
+    s_down_q = xQueueCreate(6, sizeof(DownFrame));
+    s_pin_q = xQueueCreate(2, sizeof(PinMsg));
+    char hello[96];
+    std::snprintf(hello, sizeof(hello), "lintel-panel/1 serial=%s door=%u fw=%s", s_id.serial,
+                  s_provisioned ? s_cfg.door_id : 0, kFirmware);
+    usb_link_start(hello, on_down_frame, on_provision, nullptr);
+    xTaskCreate(announce_task, "announce", 4096, nullptr, 4, nullptr);
+    ESP_LOGI(TAG, "%s pairing code %06lu", s_id.serial, static_cast<unsigned long>(s_id.pairing_code));
+
+    if (!s_provisioned) {
+        ESP_LOGW(TAG, "unassigned: waiting for adoption from the dashboard");
         park();
     }
     uint32_t ceiling = 0;
     lintel::kv_get_u32("tx_ceil", ceiling);
     s_tx.resume(ceiling);
-
-    s_down_q = xQueueCreate(6, sizeof(DownFrame));
-    s_pin_q = xQueueCreate(2, sizeof(PinMsg));
-    usb_link_start(s_cfg.door_id, on_down_frame, nullptr);
     camera_begin();
     xTaskCreate(net_task, "net", 8192, nullptr, 5, nullptr);
     ESP_LOGI(TAG, "door %u ready, waiting for controller on USB", s_cfg.door_id);
