@@ -1,0 +1,3 @@
+dependencies:
+  idf: ">=5.4"
+  jgromes/radiolib: "7.8.1"

@@ -1,0 +1,72 @@
+menu "Lintel door"
+
+    config DOOR_PIN_LOCK
+        int "Lock output GPIO (high = release)"
+        default 5
+        help
+            Drives a MOSFET or relay board for the strike. Fail-secure strikes
+            release when powered, so the default output state is low.
+
+    config DOOR_PIN_CONTACT
+        int "Door contact input GPIO (reed switch to GND, closed = shut)"
+        default 6
+
+    config DOOR_PIN_REX
+        int "Request-to-exit button GPIO (to GND)"
+        default 7
+
+    config DOOR_PIN_TAMPER
+        int "Tamper switch GPIO (to GND while the case is closed)"
+        default 4
+
+    config DOOR_HAS_SENSORS
+        bool "Contact, exit and tamper inputs are wired"
+        default n
+        help
+            Leave off on a bare board: floating inputs would raise false
+            forced-open and tamper alarms.
+
+    config DOOR_PIN_BUTTON
+        int "User button GPIO (virtual card taps)"
+        default 0
+
+    config DOOR_PIN_LED
+        int "Status LED GPIO"
+        default 18
+
+    config DOOR_PIN_VEXT
+        int "Vext enable GPIO (powers the TFT on Wireless Tracker v1.1)"
+        default 3
+
+    config DOOR_TFT_CS
+        int "TFT CS"
+        default 38
+    config DOOR_TFT_DC
+        int "TFT DC"
+        default 40
+    config DOOR_TFT_RST
+        int "TFT RESET"
+        default 39
+    config DOOR_TFT_SCLK
+        int "TFT SCLK"
+        default 41
+    config DOOR_TFT_MOSI
+        int "TFT MOSI"
+        default 42
+    config DOOR_TFT_BL
+        int "TFT backlight"
+        default 21
+    config DOOR_TFT_X_OFFSET
+        int "TFT column offset in landscape"
+        default 1
+    config DOOR_TFT_Y_OFFSET
+        int "TFT row offset in landscape"
+        default 26
+    config DOOR_TFT_MADCTL
+        hex "TFT MADCTL (rotation / colour order)"
+        default 0x68
+    config DOOR_TFT_INVERT
+        bool "TFT needs colour inversion (IPS panels)"
+        default y
+
+endmenu

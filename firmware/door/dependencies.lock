@@ -1,0 +1,29 @@
+dependencies:
+  idf:
+    source:
+      type: idf
+    version: 5.4.2
+  jgromes/radiolib:
+    component_hash: 67051f3def406f40329e1fd94ee94f1eb1f2dc2962235c8f2e900cabc366dbfa
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=4.1'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 7.8.1
+  lvgl/lvgl:
+    component_hash: 096c69af22eaf8a2b721e3913da91918c5e6bf1a762a113ec01f401aa61337a0
+    dependencies: []
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 9.2.2
+direct_dependencies:
+- idf
+- jgromes/radiolib
+- lvgl/lvgl
+manifest_hash: 2346903dd0cad25380dd006220134217726f03a4e425e202b447bb39bb5f141f
+target: esp32s3
+version: 2.0.0
