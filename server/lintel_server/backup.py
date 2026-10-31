@@ -51,6 +51,8 @@ def create_backup(data_dir: Path, db: sqlite3.Connection, passphrase: str, inclu
             for rel in ("secrets.json", "tls/server.crt", "tls/server.key"):
                 if (data_dir / rel).exists():
                     tar.add(data_dir / rel, arcname=rel)
+            if (data_dir / "plans").exists():  # floor plans are site configuration, always kept
+                tar.add(data_dir / "plans", arcname="plans")
             if include_photos and (data_dir / "photos").exists():
                 tar.add(data_dir / "photos", arcname="photos")
             info = tarfile.TarInfo("BACKUP_INFO")

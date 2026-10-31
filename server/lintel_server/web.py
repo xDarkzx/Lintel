@@ -34,6 +34,7 @@ COOKIE = "__Host-lintel_session"  # HTTPS only, host-locked, path=/
 MAX_IMAGE_PIXELS = 24_000_000
 # A PIN entry's face counts as someone else only when it is clearly a face
 # and clearly unlike every face enrolled for that PIN (match threshold 0.42).
+PLAN_MAX_SIDE = 4096  # floor plans are stored no larger than this on their long side
 IDENTITY_MIN_DETECT = 0.90
 IDENTITY_MISMATCH_BELOW = 0.25
 DUMMY_HASH = hash_password("not-a-real-password")  # equalises sign-in timing for unknown users
@@ -212,6 +213,21 @@ class WebhookIn(BaseModel):
 
 class CardEnrolIn(BaseModel):
     door_id: int = Field(ge=1, le=31)
+
+
+class FloorIn(BaseModel):
+    name: str = Field(min_length=1, max_length=40)
+    level: int = Field(0, ge=-10, le=200)
+
+
+class LocationIn(BaseModel):
+    floor_id: int | None = None  # None takes the door off the map
+    x: float = Field(0.5, ge=0, le=1)
+    y: float = Field(0.5, ge=0, le=1)
+
+
+class LockIn(BaseModel):
+    locked: bool
 
 
 def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: Any = None,
@@ -461,7 +477,8 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
     def door_rows() -> list[dict]:
         out = []
         for r in store.q("SELECT d.id, d.name, d.area, d.unlock_ms, d.credential_mode, d.last_seen, d.last_ip, "
-                         "d.rssi, v.serial, v.mac, v.firmware, v.controller, v.adopted_at "
+                         "d.rssi, d.floor_id, d.map_x, d.map_y, d.map_locked, "
+                         "v.serial, v.mac, v.firmware, v.controller, v.adopted_at "
                          "FROM doors d LEFT JOIN devices v ON v.door_id = d.id ORDER BY d.id"):
             d = dict(r)
             link = ctl.doors.get(d["id"])
@@ -1273,6 +1290,116 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
         if r is None or not r["photo"]:
             raise HTTPException(404, "no photo")
         return FileResponse(store.data_dir / "photos" / r["photo"], media_type="image/jpeg")
+
+    # ---- floor plans ------------------------------------------------------------------------------
+
+    def floor_rows() -> list[dict]:
+        out = []
+        for f in store.q("SELECT * FROM floors ORDER BY level, id"):
+            d = dict(f)
+            d["has_plan"] = bool(d.pop("plan"))
+            d["doors"] = store.q1("SELECT COUNT(*) n FROM doors WHERE floor_id=?", (f["id"],))["n"]
+            out.append(d)
+        return out
+
+    @app.get("/api/floors")
+    def floors(op: dict = Depends(viewer)) -> dict:
+        """Every floor, and every door with where it is (or is not yet) placed."""
+        return {"floors": floor_rows(), "doors": door_rows()}
+
+    @app.post("/api/floors")
+    def add_floor(body: FloorIn, op: dict = Depends(admin)) -> dict:
+        fid = store.x("INSERT INTO floors(name, level, created) VALUES(?, ?, ?)", (body.name, body.level, time.time()))
+        journal(op, "map.floor_created", f"floor '{body.name}' (level {body.level}) created")
+        hub.publish({"type": "maps"})
+        return {"id": fid}
+
+    @app.patch("/api/floors/{fid}")
+    def patch_floor(fid: int, body: FloorIn, op: dict = Depends(admin)) -> dict:
+        if store.x("UPDATE floors SET name=?, level=? WHERE id=?", (body.name, body.level, fid)) == 0:
+            raise HTTPException(404, "no such floor")
+        journal(op, "map.floor_updated", f"floor {fid} now '{body.name}' (level {body.level})")
+        hub.publish({"type": "maps"})
+        return {"ok": True}
+
+    @app.delete("/api/floors/{fid}")
+    def delete_floor(fid: int, op: dict = Depends(admin)) -> dict:
+        f = store.q1("SELECT * FROM floors WHERE id=?", (fid,))
+        if f is None:
+            raise HTTPException(404, "no such floor")
+        store.x("UPDATE doors SET floor_id=NULL, map_x=NULL, map_y=NULL, map_locked=0 WHERE floor_id=?", (fid,))
+        store.x("DELETE FROM floors WHERE id=?", (fid,))
+        if f["plan"]:
+            (store.data_dir / "plans" / f["plan"]).unlink(missing_ok=True)
+        journal(op, "map.floor_deleted", f"floor '{f['name']}' deleted; its doors were taken off the map")
+        hub.publish({"type": "maps"})
+        return {"ok": True}
+
+    @app.put("/api/floors/{fid}/plan")
+    async def upload_plan(fid: int, request: Request, op: dict = Depends(admin)) -> dict:
+        """A floor plan image. Re-encoded to PNG so only pixels are kept: no
+        metadata, scripts or polyglot payloads survive the upload."""
+        from PIL import Image
+        f = store.q1("SELECT * FROM floors WHERE id=?", (fid,))
+        if f is None:
+            raise HTTPException(404, "no such floor")
+        body = await request.body()
+        if not 0 < len(body) <= 20_000_000:
+            raise HTTPException(413, "plan too large (20 MB at most)")
+        check_image(body)
+        with Image.open(io.BytesIO(body)) as im:
+            im = im.convert("RGB")
+            im.thumbnail((PLAN_MAX_SIDE, PLAN_MAX_SIDE))
+            out = store.data_dir / "plans"
+            out.mkdir(exist_ok=True)
+            name = f"floor{fid}.png"
+            im.save(out / name, "PNG", optimize=True)
+            w, h = im.size
+        store.x("UPDATE floors SET plan=?, width=?, height=? WHERE id=?", (name, w, h, fid))
+        journal(op, "map.plan_uploaded", f"plan for '{f['name']}' uploaded ({w}x{h})")
+        hub.publish({"type": "maps"})
+        return {"ok": True, "width": w, "height": h}
+
+    @app.get("/api/floors/{fid}/plan.png")
+    def get_plan(fid: int, op: dict = Depends(viewer)):
+        f = store.q1("SELECT plan FROM floors WHERE id=?", (fid,))
+        if f is None or not f["plan"]:
+            raise HTTPException(404, "no plan uploaded")
+        return FileResponse(store.data_dir / "plans" / f["plan"], media_type="image/png",
+                            headers={"Cache-Control": "private, no-cache"})
+
+    @app.put("/api/doors/{door_id}/location")
+    def place_door(door_id: int, body: LocationIn, op: dict = Depends(admin)) -> dict:
+        d = store.q1("SELECT * FROM doors WHERE id=?", (door_id,))
+        if d is None:
+            raise HTTPException(404, "no such door")
+        if d["map_locked"]:
+            raise HTTPException(409, "this door is locked in place on the map; unlock it first")
+        if body.floor_id is None:
+            store.x("UPDATE doors SET floor_id=NULL, map_x=NULL, map_y=NULL WHERE id=?", (door_id,))
+            journal(op, "map.door_removed", f"'{d['name']}' taken off the map", door_id=door_id)
+        else:
+            f = store.q1("SELECT name FROM floors WHERE id=?", (body.floor_id,))
+            if f is None:
+                raise HTTPException(404, "no such floor")
+            store.x("UPDATE doors SET floor_id=?, map_x=?, map_y=? WHERE id=?",
+                    (body.floor_id, round(body.x, 5), round(body.y, 5), door_id))
+            journal(op, "map.door_placed", f"'{d['name']}' placed on '{f['name']}'", door_id=door_id)
+        hub.publish({"type": "maps"})
+        return {"ok": True}
+
+    @app.put("/api/doors/{door_id}/location/lock")
+    def lock_door_location(door_id: int, body: LockIn, op: dict = Depends(admin)) -> dict:
+        d = store.q1("SELECT * FROM doors WHERE id=?", (door_id,))
+        if d is None:
+            raise HTTPException(404, "no such door")
+        if body.locked and d["floor_id"] is None:
+            raise HTTPException(409, "place the door on a floor before locking it")
+        store.x("UPDATE doors SET map_locked=? WHERE id=?", (int(body.locked), door_id))
+        journal(op, "map.door_locked" if body.locked else "map.door_unlocked",
+                f"'{d['name']}' {'locked in place' if body.locked else 'unlocked'} on the map", door_id=door_id)
+        hub.publish({"type": "maps"})
+        return {"ok": True}
 
     # ---- device adoption ------------------------------------------------------------------------
 

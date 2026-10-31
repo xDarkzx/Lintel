@@ -82,6 +82,8 @@ or forge a grant.
 - Guided face enrolment with liveness checks (random head-turn steps and
   anti-spoofing on every frame, judged on the server); card enrolment by
   tapping at a door
+- Floor plan maps: doors dragged onto each level's plan and locked in place,
+  live status on every marker, and "locate on map" from search or any door
 - Encrypted backup; alarm webhook to Teams, Slack or a pager
 
 ## Screens
@@ -96,6 +98,10 @@ or forge a grant.
 | Door diagnostics: health, remote commands, live screen capture | Cardholder credentials: PIN, duress PIN, card and face enrolment |
 | ![Schedules](docs/media/console-schedules.jpg) | ![Audit trail](docs/media/console-audit.jpg) |
 | Schedules as week grids, with holidays | Audit trail verified end to end |
+
+![Maps: a door located on its floor plan](docs/media/console-maps.jpg)
+
+<sub>Maps: each level's plan with its doors placed and locked in place, live status on every marker. Demo plans are public-domain HABS drawings of a real building (see docs/demo/floor-plans).</sub>
 
 ## How it was built
 
