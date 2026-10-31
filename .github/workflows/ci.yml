@@ -33,6 +33,15 @@ jobs:
       - run: python -m pytest -q tests
       - run: pip-audit -r requirements.txt
 
+  secrets:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:v8.21.2 git /repo --no-banner --redact
+
   panel:
     name: Keypad firmware (ESP-IDF 5.4)
     runs-on: ubuntu-24.04

@@ -1,9 +1,30 @@
-# Lintel
+<p align="center">
+  <img src="docs/media/logo.svg" width="88" alt="Lintel logo">
+</p>
 
-An access control system built end to end: a touchscreen door keypad on an
-ESP32-P4, a door controller that wires it to the network, and an operator
-server with a web console. Designed the way commercial systems are, with the
-security decisions written down and tested.
+<h1 align="center">Lintel</h1>
+
+<p align="center">
+  <b>Access control from the keypad to the console.</b><br>
+  A touchscreen door keypad on an ESP32-P4, a keyless door controller, and an
+  operator server with a web console. Designed the way commercial systems are,
+  with every security decision written down and tested.
+</p>
+
+<p align="center">
+  <a href="https://github.com/xDarkzx/Lintel/actions/workflows/ci.yml"><img src="https://github.com/xDarkzx/Lintel/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-FSL--1.1--ALv2-blue" alt="License: FSL-1.1-ALv2"></a>
+  <img src="https://img.shields.io/badge/keypad-ESP32--P4-555" alt="Keypad: ESP32-P4">
+  <img src="https://img.shields.io/badge/server-Python%203.12%20%7C%20Docker-555" alt="Server: Python 3.12, Docker">
+</p>
+
+<p align="center">
+  <a href="BUILDING.md">Building</a> ·
+  <a href="docs/SECURITY.md">Threat model</a> ·
+  <a href="docs/hardware.md">Hardware</a> ·
+  <a href="docs/BUILT-WITH-AI.md">How it was built</a> ·
+  <a href="CONTRIBUTING.md">Contributing</a>
+</p>
 
 ```
  Keypad (ESP32-P4, 4.3" touch, camera)          Door controller (Pi Zero class)            Server (Docker)
@@ -105,6 +126,9 @@ produce byte-identical frames and adoption messages.
 
 ## Running it
 
+Full instructions, including first sign-in and adopting a keypad, are in
+[BUILDING.md](BUILDING.md).
+
 ```sh
 # Server (generates admin credentials, TLS certificate and controller.env in server/data)
 cd server && docker compose up -d --build        # https://localhost:8443
@@ -135,3 +159,15 @@ entry photos.
 Next: RC522 card reader driver (wiring on JP1 is documented in
 [docs/hardware.md](docs/hardware.md)), the keypad's face-scan flow, and
 production firmware protection ([docs/production-hardening.md](docs/production-hardening.md)).
+
+## Licence
+
+Lintel is licensed under the [Functional Source License, Version 1.1, ALv2
+Future License](LICENSE) (FSL-1.1-ALv2). You may use, modify and redistribute
+it for any purpose except offering a competing commercial product or service.
+Each release becomes available under the Apache License 2.0 two years after it
+is published.
+
+For commercial licensing, partnerships or pilot installations, contact
+[@xDarkzx](https://github.com/xDarkzx). Bundled third-party components keep
+their own licences; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

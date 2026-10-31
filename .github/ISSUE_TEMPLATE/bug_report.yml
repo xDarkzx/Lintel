@@ -1,0 +1,52 @@
+name: Bug report
+description: Something in Lintel does not work as documented
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Security problems must not be reported here. Use [private reporting](https://github.com/xDarkzx/Lintel/security/advisories/new) instead.
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - Keypad firmware
+        - Door controller
+        - Server
+        - Web console
+        - Protocol core
+        - Documentation
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      placeholder: v0.1.0 or a commit hash
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Keypad serial log, door controller output or server log. Remove PINs, tokens and personal data first.
+      render: text
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Hardware, ESP-IDF version, host OS, Docker version.
