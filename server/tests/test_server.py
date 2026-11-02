@@ -280,12 +280,13 @@ def test_operator_two_factor_and_login_lockout(env):
     assert setup["qr_svg"].startswith("<?xml") or setup["qr_svg"].startswith("<svg")
     assert client.post("/api/me/mfa/confirm", json={"code": "000000" if totp_now(setup["secret"]) != "000000"
                                                     else "111111"}).status_code == 400
-    assert client.post("/api/me/mfa/confirm", json={"code": totp_now(setup["secret"])}).status_code == 200
+    confirmed = totp_now(setup["secret"])
+    assert client.post("/api/me/mfa/confirm", json={"code": confirmed}).status_code == 200
 
     pw = (store.data_dir / "initial_admin.txt").read_text().split("password: ")[1].strip()
     fresh = TestClient(client.app)
     assert fresh.post("/api/login", json={"username": "admin", "password": pw}).json() == {"mfa_required": True}
-    code = totp_now(setup["secret"])
+    code = confirmed  # the very code just spent (computing it again could land in the next 30 s step)
     # The code used to confirm is spent; the same 30 s step cannot be replayed.
     assert fresh.post("/api/login", json={"username": "admin", "password": pw, "code": code}).status_code == 401
 

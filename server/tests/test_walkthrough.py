@@ -278,3 +278,17 @@ def test_a_keypad_cannot_be_adopted_into_a_walk_through_door(walk_env):
                       json={"pairing_code": adopt.pairing_code(pk), "door_id": 1})
     assert r.status_code == 409 and "keypad" in r.json()["detail"]
     assert w.store.q1("SELECT door_id FROM devices WHERE serial='LNT-0000000000A2'")["door_id"] is None
+
+
+def test_the_alarm_event_carries_the_evidence_photo_when_it_is_published(walk_env):
+    """The console's map shows the tailgater's photo from the event itself, so
+    the evidence must be attached before the event goes out."""
+    w = walk_env
+    published = []
+    w.ctl.publish = published.append
+    w.ctl.on_face_evidence = lambda ev, jpeg, door, label: ev.__setitem__("photo", "evidence.jpg")
+    face_in(w, 0x0101, ANA)
+    face_in(w, 0x0102, STRANGER)
+    send_crossing(w, Crossing(0x0100, 2, False, (0x0101, 0x0102)))
+    ev = next(m["event"] for m in published if m["type"] == "event" and m["event"]["kind"] == "door.unauthorised_person")
+    assert ev["photo"] == "evidence.jpg"

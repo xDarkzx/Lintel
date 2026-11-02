@@ -14,7 +14,10 @@ services:
     environment:
       TZ: Pacific/Auckland
       LINTEL_DATA: /data
+      LINTEL_DEMO_PLANS: /plans
       LINTEL_DEMO_START_DELAY: ${LINTEL_DEMO_START_DELAY:-0}  # seconds before the showcase, e.g. to record it
+    volumes:
+      - ../docs/demo/floor-plans:/plans:ro  # public-domain plans for the Maps page
     tmpfs:
       - /data:uid=1000,gid=1000,mode=0700
     cap_drop: [ALL]

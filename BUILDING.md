@@ -182,9 +182,3 @@ gitleaks secret scan and a firmware build on every push and pull request.
 |---|---|
 | Console icon sprite | `python server/tools/build_icons.py <@tabler/icons package>/icons/outline` |
 | Keypad fonts | `firmware/panel/tools/build_fonts.sh` (needs Node.js) |
-| README screenshots | `python server/tools/capture_console.py <out dir> [--url URL]` |
-| README walkthrough GIF | `python server/tools/record_walkthrough.py <out.gif> [--url URL]` |
-
-The capture tools need Playwright with Microsoft Edge, a running server, and
-for the walkthrough a keypad attached through the door controller.
-Cardholder names are replaced and entry photos blurred in every capture.

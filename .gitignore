@@ -10,3 +10,12 @@ secrets/
 *.keys.json
 build-*.log
 *.log
+
+# Local only, never in the repository: media capture scripts, raw video,
+# planning notes and agent workspaces.
+server/tools/capture_console.py
+server/tools/record_walkthrough.py
+server/tools/record_demo.py
+docs/media/*.webm
+docs/superpowers/
+.superpowers/

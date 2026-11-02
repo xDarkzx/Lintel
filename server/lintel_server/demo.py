@@ -2,7 +2,7 @@
 that generate traffic over the real protocol, so the console can be explored
 without any hardware.
 
-    docker compose -f demo/compose.yaml up      # then open https://localhost:8443
+    docker compose -f demo/compose.yaml up --build      # then open https://localhost:8443
 
 Everything a door sends here goes through the same path a keypad's or a
 Lintel Vision unit's would: sealed UDP frames, signed HTTPS uploads, the
@@ -20,6 +20,7 @@ import asyncio
 import hashlib
 import http.client
 import io
+import json
 import logging
 import os
 import random
@@ -41,7 +42,7 @@ log = logging.getLogger("lintel.demo")
 TAG = b"lintel-demo-face:"
 
 
-# ---- people and faces --------------------------------------------------------------------------
+# ---- the site -----------------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class Person:
@@ -57,34 +58,73 @@ class Person:
         return f"{self.first} {self.last}"
 
 
+@dataclass(frozen=True)
+class Door:
+    id: int
+    name: str
+    area: str
+    mode: str
+    floor: str  # a key of FLOORS
+    x: float    # position on the plan, as fractions
+    y: float
+
+
 PEOPLE = (
     Person("Aroha", "Ngata", "2468", ("Staff", "IT"), duress="8642"),
     Person("Ben", "Carter", "3579", ("Staff",)),
     Person("Mei", "Chen", "4826", ("Staff",)),
     Person("Sam", "Patel", "5937", ("Staff", "IT")),
-    Person("Tom", "Wilson", "6149", ("Contractors",)),  # enrolled, but no access to the lab
+    Person("Lucy", "Fraser", "7351", ("Staff",)),
+    Person("Hemi", "Walker", "8264", ("Staff",)),
+    Person("Priya", "Singh", "9173", ("Staff", "IT")),
+    Person("Tom", "Wilson", "6149", ("Contractors",)),  # enrolled, but no access upstairs
 )
 STAFF = [p for p in PEOPLE if "Staff" in p.groups]
-DOORS = (  # id, name, area, credential mode
-    (1, "Main Entrance", "Ground floor", "pin"),
-    (2, "Server Room", "Ground floor", "pin"),
-    (3, "Lab (Lintel Vision)", "Level 1", "face_group"),
+IT = [p for p in PEOPLE if "IT" in p.groups]
+
+# Two levels of a public-domain plan (docs/demo/floor-plans); doors sit where the rooms' doors are.
+FLOORS = {"ground": ("Ground floor", 0, "ground-floor.png"), "level-1": ("Level 1", 1, "level-1.png")}
+MAIN, SERVERS, LAB = "Main Entrance", "Server Room", "Lab (Lintel Vision)"
+DOORS = (
+    Door(1, MAIN, "Ground floor", "pin", "ground", 0.50, 0.86),
+    Door(2, SERVERS, "Ground floor", "pin", "ground", 0.41, 0.15),
+    Door(3, LAB, "Level 1", "face_group", "level-1", 0.30, 0.39),
+    Door(4, "Reception", "Ground floor", "pin", "ground", 0.60, 0.65),
+    Door(5, "General Office", "Ground floor", "pin", "ground", 0.38, 0.65),
+    Door(6, "Stock Room", "Ground floor", "pin", "ground", 0.60, 0.33),
+    Door(7, "Boardroom", "Level 1", "pin", "level-1", 0.60, 0.43),
+    Door(8, "Clean Room", "Level 1", "pin", "level-1", 0.39, 0.50),
 )
-GROUPS = {"Staff": (1, 3), "IT": (1, 2), "Contractors": (1,)}
+GROUPS = {"Staff": (1, 3, 4, 5, 7, 8), "IT": (1, 2, 6), "Contractors": (1, 4)}
+
+
+# ---- faces --------------------------------------------------------------------------------------
+
+SKIN = ((255, 219, 172), (241, 194, 125), (224, 172, 105), (198, 134, 66), (141, 85, 36), (233, 190, 160))
+HAIR = ((35, 28, 25), (90, 56, 37), (180, 130, 70), (60, 40, 30), (20, 20, 20), (140, 140, 140))
+SHIRT = ((37, 99, 235), (22, 163, 74), (220, 38, 38), (124, 58, 237), (15, 118, 110), (202, 138, 4))
 
 
 def face_jpeg(name: str) -> bytes:
-    """A cartoon face for a demo person, tagged so DemoFaces knows who it is."""
+    """A cartoon portrait for a demo person, tagged so DemoFaces knows who it is."""
     h = hashlib.sha256(name.encode()).digest()
-    img = Image.new("RGB", (320, 240), (40, 44, 52))
+    skin, hair, shirt = SKIN[h[0] % len(SKIN)], HAIR[h[1] % len(HAIR)], SHIRT[h[2] % len(SHIRT)]
+    img = Image.new("RGB", (320, 240), (226 - h[3] % 30, 232 - h[4] % 30, 240 - h[5] % 30))
     d = ImageDraw.Draw(img)
-    d.ellipse((110, 40, 210, 170), fill=(200 + h[0] % 55, 150 + h[1] % 60, 110 + h[2] % 60))
-    d.ellipse((135, 85, 150, 100), fill=(30, 30, 30))
-    d.ellipse((170, 85, 185, 100), fill=(30, 30, 30))
-    d.arc((140, 110, 180, 145), 20, 160, fill=(90, 30, 30), width=4)
-    d.rectangle((100, 170, 220, 240), fill=(h[3], h[4], h[5]))
+    d.rounded_rectangle((90, 175, 230, 260), 40, fill=shirt)                  # shoulders
+    d.rectangle((145, 150, 175, 185), fill=skin)                              # neck
+    if h[6] % 2:                                                              # long hair behind the face
+        d.rounded_rectangle((100, 40, 220, 175), 50, fill=hair)
+    d.ellipse((112, 48, 208, 165), fill=skin)                                 # face
+    d.pieslice((106, 34, 214, 120), 180, 360, fill=hair)                      # hair on top
+    for ex in (138, 170):                                                     # eyes and brows
+        d.ellipse((ex, 96, ex + 12, 108), fill=(255, 255, 255))
+        d.ellipse((ex + 3, 99, ex + 9, 105), fill=(40, 30, 25))
+        d.line((ex - 2, 90, ex + 14, 88 + h[7] % 4), fill=hair, width=3)
+    d.line((160, 108, 156, 126), fill=tuple(max(0, c - 40) for c in skin), width=2)  # nose
+    d.arc((142, 120, 178, 146), 20, 160, fill=(150, 60, 60), width=3)               # smile
     buf = io.BytesIO()
-    img.save(buf, "JPEG", quality=90, comment=TAG + name.encode())
+    img.save(buf, "JPEG", quality=88, comment=TAG + name.encode())
     return buf.getvalue()
 
 
@@ -105,7 +145,7 @@ class DemoFaces:
         comment = Image.open(io.BytesIO(jpeg)).info.get("comment", b"")
         if not comment.startswith(TAG):
             raise FaceError("no face found")
-        return FaceResult(self.embedding(comment[len(TAG):].decode()), (110, 40, 100, 130), 0.95, None)
+        return FaceResult(self.embedding(comment[len(TAG):].decode()), (112, 48, 96, 117), 0.95, None)
 
     @staticmethod
     def embedding(name: str) -> np.ndarray:
@@ -114,17 +154,29 @@ class DemoFaces:
         return v / np.linalg.norm(v)
 
 
-# ---- the site ----------------------------------------------------------------------------------
+# ---- seeding ------------------------------------------------------------------------------------
 
-def seed(store) -> None:
-    """Doors, groups, people and their faces. Does nothing on a site that is already seeded."""
-    if store.q1("SELECT 1 FROM doors WHERE name=?", (DOORS[-1][1],)):
+def seed(store, plans: Path | None) -> None:
+    """Doors, floor plans, groups, people and their faces. Does nothing on a
+    site that is already seeded. Without `plans` the doors are not on a map."""
+    if store.q1("SELECT 1 FROM doors WHERE name=?", (DOORS[-1].name,)):
         return
     now = time.time()
+    floor_ids = _seed_floors(store, plans, now)
     always = store.q1("SELECT id FROM schedules WHERE name='24/7'")["id"]
-    for door_id, name, area, mode in DOORS:
-        store.x("INSERT INTO doors(id, name, area, key, credential_mode, key_created) VALUES(?, ?, ?, ?, ?, ?)",
-                (door_id, name, area, store.seal_door_key(door_id, secrets.token_bytes(16)), mode, now))
+    for d in DOORS:
+        placed = d.floor in floor_ids
+        store.x("INSERT INTO doors(id, name, area, key, credential_mode, key_created, floor_id, map_x, map_y, "
+                "map_locked) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (d.id, d.name, d.area, store.seal_door_key(d.id, secrets.token_bytes(16)), d.mode, now,
+                 floor_ids.get(d.floor), d.x if placed else None, d.y if placed else None, int(placed)))
+        if d.mode != "face_group":  # an adopted keypad; walk-through doors use a Lintel Vision unit instead
+            serial = "LNT-" + hashlib.sha256(f"demo-keypad-{d.id}".encode()).hexdigest()[:12].upper()
+            mac = ":".join(f"{b:02X}" for b in hashlib.sha256(serial.encode()).digest()[:6])
+            store.x("INSERT INTO devices(serial, pubkey, mac, firmware, controller, first_seen, last_seen, door_id, "
+                    "reported_door, adopted_at, adopt_seq) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (serial, secrets.token_bytes(32), mac, "1.4.2", f"door-ctl-{d.id:02d}", now, now, d.id, d.id,
+                     now, 1))
     group_ids = {}
     for g, doors in GROUPS.items():
         group_ids[g] = store.x("INSERT INTO access_groups(name, schedule_id) VALUES(?, ?)", (g, always))
@@ -140,7 +192,30 @@ def seed(store) -> None:
             emb = DemoFaces.embedding(p.name)
             store.x("INSERT INTO face_templates(cardholder_id, embedding, source, created) VALUES(?, ?, ?, ?)",
                     (cid, store.seal_template(cid, emb.tobytes()), "demo", now))
-    store.journal("demo.seeded", operator="system", detail="demo site created: 3 doors, 5 people")
+    store.journal("demo.seeded", operator="system",
+                  detail=f"demo site created: {len(DOORS)} doors, {len(floor_ids)} floor plans, {len(PEOPLE)} people")
+
+
+def _seed_floors(store, plans: Path | None, now: float) -> dict[str, int]:
+    """Floors with their plans, stored as the console's own upload stores them."""
+    from .web import PLAN_MAX_SIDE
+    ids: dict[str, int] = {}
+    if plans is None or not plans.is_dir():
+        return ids
+    out = store.data_dir / "plans"
+    out.mkdir(exist_ok=True)
+    for key, (name, level, file) in FLOORS.items():
+        if not (plans / file).exists():
+            continue
+        fid = store.x("INSERT INTO floors(name, level, created) VALUES(?, ?, ?)", (name, level, now))
+        with Image.open(plans / file) as im:
+            im = im.convert("RGB")
+            im.thumbnail((PLAN_MAX_SIDE, PLAN_MAX_SIDE))
+            im.save(out / f"floor{fid}.png", "PNG", optimize=True)
+            w, h = im.size
+        store.x("UPDATE floors SET plan=?, width=?, height=? WHERE id=?", (f"floor{fid}.png", w, h, fid))
+        ids[key] = fid
+    return ids
 
 
 class Doors:
@@ -151,10 +226,13 @@ class Doors:
                  post: Callable[[str, bytes, dict[str, str]], tuple[int, dict]]) -> None:
         self.deliver, self.post = deliver, post
         self.units: dict[str, VisionUnit] = {}
-        for r in store.q("SELECT id, name, key, rx_highest FROM doors ORDER BY id"):
+        self.keypads: list[VisionUnit] = []
+        for r in store.q("SELECT id, name, key, rx_highest, credential_mode FROM doors ORDER BY id"):
             u = VisionUnit(r["id"], store.door_key(r["id"], r["key"]), store.secrets.net_id, deliver, post)
             u.ctr = r["rx_highest"]
             self.units[r["name"]] = u
+            if r["credential_mode"] != "face_group":
+                self.keypads.append(u)
 
     def __getitem__(self, name: str) -> VisionUnit:
         return self.units[name]
@@ -163,25 +241,57 @@ class Doors:
         for u in self.units.values():
             u.heartbeat()
 
+    def diag_all(self) -> None:
+        for i, u in enumerate(self.keypads):
+            u.diag(uptime_s=86_400 * (3 + i) + 3_600 * i, temp_c=38 + i % 5)
+
 
 # ---- scenarios: each one is something a visitor should see in the console -----------------------
 
-LAB, MAIN, SERVERS = "Lab (Lintel Vision)", "Main Entrance", "Server Room"
+def keypad(doors: Doors, door: str, pin: str, who: str) -> None:
+    """A PIN at a keypad, then the photo the keypad takes of every attempt."""
+    doors[door].pin(pin)
+    doors[door].photo(face_jpeg(who))
 
 
-def pin_entry(doors: Doors) -> None:
+def front_door_entry(doors: Doors) -> None:
     p = random.choice(PEOPLE)
-    doors[MAIN].pin(p.pin)
+    keypad(doors, MAIN, p.pin, p.name)
+
+
+def reception_entry(doors: Doors) -> None:
+    p = random.choice(PEOPLE)
+    keypad(doors, "Reception", p.pin, p.name)
+
+
+def office_entry(doors: Doors) -> None:
+    p = random.choice(STAFF)
+    keypad(doors, "General Office", p.pin, p.name)
+
+
+def boardroom_entry(doors: Doors) -> None:
+    p = random.choice(STAFF)
+    keypad(doors, "Boardroom", p.pin, p.name)
+
+
+def clean_room_entry(doors: Doors) -> None:
+    p = random.choice(STAFF)
+    keypad(doors, "Clean Room", p.pin, p.name)
 
 
 def server_room_entry(doors: Doors) -> None:
-    doors[SERVERS].pin(random.choice([p for p in PEOPLE if "IT" in p.groups]).pin)
+    p = random.choice(IT)
+    keypad(doors, SERVERS, p.pin, p.name)
+
+
+def wrong_pin(doors: Doors) -> None:
+    keypad(doors, "Stock Room", "1593", "A Visitor")
 
 
 def walk_through_group(doors: Doors) -> None:
     u = doors[LAB]
     u.start_passage()
-    group = random.sample(STAFF, random.randint(1, 3))
+    group = random.sample(STAFF, random.randint(2, 3))
     for i, p in enumerate(group, 1):
         u.present(i, face_jpeg(p.name), depth_face_png())
     u.crossed(len(group), list(range(1, len(group) + 1)))
@@ -193,7 +303,7 @@ def stranger_tailgates(doors: Doors) -> None:
     group = random.sample(STAFF, 2)
     for i, p in enumerate(group, 1):
         u.present(i, face_jpeg(p.name), depth_face_png())
-    u.present(3, face_jpeg("A Visitor"), depth_face_png())  # not enrolled
+    u.present(3, face_jpeg("A Stranger"), depth_face_png())  # not enrolled
     u.crossed(3, [1, 2, 3])
 
 
@@ -220,21 +330,29 @@ def photo_spoof(doors: Doors) -> None:
 
 def pin_guessing(doors: Doors) -> None:
     for guess in ("1357", "2580", "1470"):
-        doors[SERVERS].pin(guess)
+        keypad(doors, SERVERS, guess, "A Stranger")
 
 
 def duress(doors: Doors) -> None:
-    doors[MAIN].pin(PEOPLE[0].duress)
+    keypad(doors, MAIN, PEOPLE[0].duress, PEOPLE[0].name)
 
 
-SCENARIOS = (pin_entry, server_room_entry, walk_through_group, stranger_tailgates, contractor_follows_into_the_lab,
+SCENARIOS = (front_door_entry, reception_entry, office_entry, boardroom_entry, clean_room_entry, server_room_entry,
+             walk_through_group, wrong_pin, stranger_tailgates, contractor_follows_into_the_lab,
              hidden_behind_someone, photo_spoof, pin_guessing, duress)
-WEIGHTS = (30, 10, 30, 6, 4, 3, 3, 2, 1)  # mostly ordinary days, with the occasional incident
-# The first minute after start: every scenario once, incidents early, so a
-# visitor sees everything Lintel does before the ordinary day takes over.
-SHOWCASE = (walk_through_group, stranger_tailgates, pin_entry, photo_spoof, contractor_follows_into_the_lab,
-            server_room_entry, pin_guessing, hidden_behind_someone, duress)
-SHOWCASE_GAP_S = 6
+WEIGHTS = (24, 10, 10, 6, 6, 8, 20, 4, 4, 3, 2, 2, 1, 1)  # mostly ordinary days, with the occasional incident
+
+# The first minute and a bit after start, timed (seconds) so that everything
+# happens while the console is showing the right place: the ground floor map
+# from 8 s, Level 1 from 24 s. Then the ordinary day takes over.
+SHOWCASE = (
+    (1, front_door_entry), (3.5, front_door_entry), (6, walk_through_group),
+    (9, front_door_entry), (11, office_entry), (13, reception_entry), (15, wrong_pin), (17, server_room_entry),
+    (19, pin_guessing), (22, front_door_entry),
+    (25, walk_through_group), (28, boardroom_entry), (31, stranger_tailgates), (35, photo_spoof),
+    (37.5, contractor_follows_into_the_lab), (40, hidden_behind_someone), (42, clean_room_entry),
+    (46, duress), (50, front_door_entry),
+)
 
 
 # ---- running against the real server ------------------------------------------------------------
@@ -257,7 +375,6 @@ def _https(port: int, token: str) -> Callable[[str, bytes, dict[str, str]], tupl
     ctx = ssl._create_unverified_context()
 
     def post(path: str, body: bytes, headers: dict[str, str]) -> tuple[int, dict]:
-        import json
         conn = http.client.HTTPSConnection("127.0.0.1", port, timeout=10, context=ctx)
         try:
             conn.request("POST", path, body=body, headers={**headers, "Authorization": f"Bearer {token}"})
@@ -270,28 +387,34 @@ def _https(port: int, token: str) -> Callable[[str, bytes, dict[str, str]], tupl
 
 def run_traffic(store, http_port: int, udp_port: int, stop: Callable[[], bool] = lambda: False) -> None:
     doors = Doors(store, _udp(udp_port), _https(http_port, store.secrets.controller_token))
+    beat = [time.time()]
     doors.heartbeat_all()
-    last_beat = time.time()
-    # Optionally hold the showcase back (time to sign in and start recording),
-    # still heartbeating so the doors do not drop offline meanwhile.
-    begin = time.time() + float(os.environ.get("LINTEL_DEMO_START_DELAY", "0"))
-    while time.time() < begin and not stop():
-        if time.time() - last_beat > 10:
-            doors.heartbeat_all()
-            last_beat = time.time()
-        time.sleep(min(1.0, max(0.0, begin - time.time())))
-    showcase = list(SHOWCASE)
-    while not stop():
-        try:
-            if time.time() - last_beat > 10:
+    doors.diag_all()
+
+    def wait_until(t: float) -> None:
+        # Sleeps, heartbeating so no door drops offline meanwhile.
+        while time.time() < t and not stop():
+            if time.time() - beat[0] > 10:
                 doors.heartbeat_all()
-                last_beat = time.time()
-            scenario = showcase.pop(0) if showcase else random.choices(SCENARIOS, WEIGHTS)[0]
+                beat[0] = time.time()
+            time.sleep(min(0.25, max(0.0, t - time.time())))
+
+    def play(scenario) -> None:
+        try:
             scenario(doors)
             log.info("demo: %s", scenario.__name__.replace("_", " "))
         except Exception:  # a demo keeps going; the server's own logs say what it refused
             log.exception("demo scenario failed")
-        time.sleep(SHOWCASE_GAP_S if showcase else random.uniform(4, 9))
+
+    # Optionally hold the showcase back (time to sign in and start recording).
+    start = time.time() + float(os.environ.get("LINTEL_DEMO_START_DELAY", "0"))
+    wait_until(start)
+    for at, scenario in SHOWCASE:
+        wait_until(start + at)
+        play(scenario)
+    while not stop():
+        wait_until(time.time() + random.uniform(3, 7))
+        play(random.choices(SCENARIOS, WEIGHTS)[0])
 
 
 async def traffic(store, ctl, http_port: int, udp_port: int) -> None:
@@ -309,10 +432,11 @@ def main() -> None:
     from .store import Store
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     data = Path(os.environ.get("LINTEL_DATA", "demo-data"))
+    plans = Path(os.environ.get("LINTEL_DEMO_PLANS", Path(__file__).resolve().parents[2] / "docs/demo/floor-plans"))
     http_port = int(os.environ.get("LINTEL_HTTPS_PORT", "8443"))
     udp_port = int(os.environ.get("LINTEL_UDP_PORT", "47800"))
     store = Store(data)
-    seed(store)
+    seed(store, plans)
     init = data / "initial_admin.txt"
     if init.exists():
         pw = init.read_text().split("password: ")[1].strip()
