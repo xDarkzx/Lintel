@@ -1,0 +1,22 @@
+# The Lintel demo: a real server, a seeded site, and doors generating traffic.
+#   docker compose -f demo/compose.yaml up --build
+# then open https://localhost:8443 (self-signed certificate) and sign in with
+# the admin password printed in the log ("DEMO: sign in at ...").
+# Data lives in memory: every start is a fresh site.
+services:
+  lintel-demo:
+    build: ../server
+    image: lintel-server:demo
+    container_name: lintel-demo
+    command: ["python", "-m", "lintel_server.demo"]
+    ports:
+      - "${LINTEL_DEMO_PORT:-8443}:8443/tcp"  # LINTEL_DEMO_PORT=9443 if 8443 is taken
+    environment:
+      TZ: Pacific/Auckland
+      LINTEL_DATA: /data
+      LINTEL_DEMO_START_DELAY: ${LINTEL_DEMO_START_DELAY:-0}  # seconds before the showcase, e.g. to record it
+    tmpfs:
+      - /data:uid=1000,gid=1000,mode=0700
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true

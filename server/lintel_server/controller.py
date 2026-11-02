@@ -10,7 +10,9 @@ import asyncio
 import hashlib
 import hmac
 import logging
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -18,9 +20,11 @@ from .access import AccessEngine
 import json
 from dataclasses import asdict
 
-from .protocol import (CredReq, Decision, Diag, FrameError, Header, Heartbeat, HeartbeatAck, MsgType, PinReq,
-                       PinResp, Reason, ReplayWindow, SiteMode, dir_for, Dir, open_frame, peek_header, seal)
+from .protocol import (CredMode, CredReq, Crossing, CrossingAck, Decision, Diag, FrameError, Header, Heartbeat,
+                       HeartbeatAck, MsgType, PinReq, PinResp, Reason, ReplayWindow, SiteMode, dir_for, Dir,
+                       open_frame, peek_header, seal)
 from .store import Store
+from .walkthrough import PassageBook
 
 log = logging.getLogger("lintel.controller")
 
@@ -72,7 +76,14 @@ class Controller:
     face_results: dict[tuple[int, int], tuple] = field(default_factory=dict)
     # door -> queue of (command, command_id), one handed over per heartbeat ack, in order
     commands: dict[int, list[tuple[int, int]]] = field(default_factory=dict)
+    # Lintel Vision: each walk-through passage's per-person decisions, until its crossing report
+    passages: PassageBook = field(default_factory=PassageBook)
     next_command_id: int = field(default_factory=lambda: int(time.time()) & 0x7FFFFFFF)
+    # Door links, counters, commands and face results are touched by the UDP
+    # worker, the API's worker threads and supervision. One lock keeps them
+    # consistent: in particular a door reloaded by the API must never resume
+    # from a counter ceiling that a frame being sent has already passed.
+    _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
     # ---- door table -----------------------------------------------------------
 
@@ -81,6 +92,10 @@ class Controller:
             self.load_door(r["id"])
 
     def load_door(self, door_id: int) -> None:
+        with self._lock:
+            self._load_door(door_id)
+
+    def _load_door(self, door_id: int) -> None:
         r = self.store.q1("SELECT * FROM doors WHERE id=?", (door_id,))
         if r is None:
             self.doors.pop(door_id, None)
@@ -107,6 +122,10 @@ class Controller:
     # ---- datagram entry point ------------------------------------------------------
 
     def datagram(self, data: bytes, addr: tuple[str, int]) -> None:
+        with self._lock:
+            self._datagram(data, addr)
+
+    def _datagram(self, data: bytes, addr: tuple[str, int]) -> None:
         try:
             h = peek_header(data)
         except FrameError:
@@ -139,6 +158,8 @@ class Controller:
                 self._on_pin(d, h, PinReq.decode(pt), addr, now)
             elif h.type == MsgType.CRED_REQ:
                 self._on_cred(d, h, CredReq.decode(pt), addr, now)
+            elif h.type == MsgType.CROSSING:
+                self._on_crossing(d, h, Crossing.decode(pt), addr, now)
             elif h.type == MsgType.DIAG:
                 diag = asdict(Diag.decode(pt))
                 self.store.x("UPDATE doors SET diag=?, diag_ts=? WHERE id=?", (json.dumps(diag), now, d.id))
@@ -187,6 +208,39 @@ class Controller:
             scored = face[2] is None and face[1] >= 0
             v.method = (f"face {face[1]:.2f}" if scored else "face") + (" + PIN" if req.pin else "")
         self._decided(d, h, v, addr, now, face_jpeg)
+        if req.face_ref and self.engine.door_mode(d.id) == CredMode.FACE_GROUP:
+            self.passages.record(d.id, req.face_ref, v.decision == Decision.GRANT, v.cardholder, face_jpeg, now)
+
+    def _on_crossing(self, d: DoorLink, h: Header, c: Crossing, addr: tuple[str, int], now: float) -> None:
+        """The door closed after a walk-through passage: compare who crossed with
+        who was authorised. Anyone else is an unauthorised person (P1), whether
+        a stranger or an enrolled person without access here; the door stays in
+        service and the alarm is handled in the console."""
+        if self.engine.door_mode(d.id) != CredMode.FACE_GROUP:
+            self._reject(d, now, "crossing report at a door not in walk-through mode")
+            return
+        r = self.passages.reconcile(d.id, c, now)
+        if r.unauthorised:
+            def name(t) -> str:
+                return f"{t.cardholder['first_name']} {t.cardholder['last_name']}".strip()
+            named = [name(t) for t in r.tailgaters if t.cardholder]
+            unknown = r.unauthorised - len(named)
+            who = ", ".join(named + ([f"{unknown} unrecognised" if unknown > 1 else "unrecognised"]
+                                     if unknown else []))
+            allowed = ", ".join(name(t) for t in r.authorised) or "nobody"
+            ev = self.store.journal(
+                "door.unauthorised_person", door_id=d.id,
+                cardholder_id=next((t.cardholder["id"] for t in r.tailgaters if t.cardholder), None),
+                detail=f"{c.entered} through {d.name} on passage #{c.passage >> 8}; authorised: {allowed}; "
+                       f"unauthorised: {who}" + (" (counted overhead)" if c.overhead else ""))
+            jpeg = next((t.jpeg for t in r.tailgaters if t.jpeg), None)
+            if jpeg and self.on_face_evidence:
+                self.on_face_evidence(ev, jpeg, d.name, "UNAUTHORISED PERSON")
+            al = self.store.raise_alarm(1, "door.unauthorised_person", f"Unauthorised person at {d.name}: {who}",
+                                        door_id=d.id, event_seq=ev["seq"])
+            self.publish({"type": "event", "event": ev})
+            self.publish({"type": "alarm", "alarm": al})
+        self._send(d, MsgType.CROSSING_ACK, CrossingAck(c.passage, min(r.unauthorised, 255)).encode(), addr)
 
     def _on_pin(self, d: DoorLink, h: Header, req: PinReq, addr: tuple[str, int], now: float) -> None:
         self._decided(d, h, self.engine.decide_pin(d.id, req.pin, now), addr, now, None)
@@ -230,6 +284,10 @@ class Controller:
     # ---- supervision ---------------------------------------------------------------------
 
     def supervise(self) -> None:
+        with self._lock:
+            self._supervise()
+
+    def _supervise(self) -> None:
         now = time.time()
         for d in self.doors.values():
             if d.online and now - d.last_seen > SUPERVISE_S:
@@ -250,6 +308,10 @@ class Controller:
         """Keeps a face result for the request that cites it. Results nobody
         claims expire, and at most FACE_RESULTS_MAX are held, so face images
         cannot pile up in memory."""
+        with self._lock:
+            self._hold_face(door_id, ref, result)
+
+    def _hold_face(self, door_id: int, ref: int, result: tuple) -> None:
         now = time.time()
         for k in [k for k, v in self.face_results.items() if now - v[2] > FACE_RESULT_TTL_S]:
             del self.face_results[k]
@@ -258,6 +320,10 @@ class Controller:
         self.face_results[(door_id, ref)] = result
 
     def queue_command(self, door_id: int, command: int) -> int:
+        with self._lock:
+            return self._queue_command(door_id, command)
+
+    def _queue_command(self, door_id: int, command: int) -> int:
         self.next_command_id = (self.next_command_id + 1) & 0x7FFFFFFF or 1
         queue = self.commands.setdefault(door_id, [])
         if len(queue) >= 8:
@@ -277,23 +343,42 @@ class Controller:
 
 
 class _Proto(asyncio.DatagramProtocol):
-    def __init__(self, ctl: Controller) -> None:
-        self.ctl = ctl
+    """Hands each datagram to one worker thread, in arrival order, so database
+    work for an access decision never stalls the event loop that serves the
+    console and its live feed. Replies are sent back on the event loop."""
+
+    def __init__(self, ctl: Controller, worker: ThreadPoolExecutor) -> None:
+        self.ctl, self.worker = ctl, worker
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
-        self.ctl.transport = transport  # type: ignore[assignment]
+        self.ctl.transport = _LoopSender(asyncio.get_running_loop(), transport)  # type: ignore[assignment]
 
     def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
+        self.worker.submit(self._handle, data, addr)
+
+    def _handle(self, data: bytes, addr: tuple[str, int]) -> None:
         try:
             self.ctl.datagram(data, addr)
         except Exception:  # never let one bad packet stop the listener
             log.exception("datagram handling failed")
 
 
+class _LoopSender:
+    """asyncio transports belong to their event loop; the worker sends through it."""
+
+    def __init__(self, loop: asyncio.AbstractEventLoop, transport: Any) -> None:
+        self.loop, self.transport = loop, transport
+
+    def sendto(self, data: bytes, addr: tuple[str, int]) -> None:
+        self.loop.call_soon_threadsafe(self.transport.sendto, data, addr)
+
+
 async def run_controller(ctl: Controller, host: str, port: int) -> None:
     loop = asyncio.get_running_loop()
-    await loop.create_datagram_endpoint(lambda: _Proto(ctl), local_addr=(host, port))
+    # One thread: frames from a door are handled in the order they arrived.
+    worker = ThreadPoolExecutor(1, thread_name_prefix="lintel-udp")
+    await loop.create_datagram_endpoint(lambda: _Proto(ctl, worker), local_addr=(host, port))
     log.info("door controller listening on udp/%d", port)
     while True:
         await asyncio.sleep(2)
-        ctl.supervise()
+        await loop.run_in_executor(worker, ctl.supervise)

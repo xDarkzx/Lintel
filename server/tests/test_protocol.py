@@ -60,3 +60,24 @@ def test_cred_req_rejects_inconsistent_fields():
     bad_uid_len = bytes([1, 5]) + bytes(10) + bytes([0]) + bytes(8) + bytes(4)
     with pytest.raises(FrameError):
         CredReq.decode(bad_uid_len)
+
+
+def test_crossing_round_trips_and_rejects_malformed():
+    from lintel_server.protocol import CredMode, Crossing, CrossingAck, Dir, dir_for
+    c = Crossing(passage=0x1200, entered=3, overhead=True, refs=(0x1201, 0x1202))
+    assert Crossing.decode(c.encode()) == c and len(c.encode()) == 39
+    good = c.encode()
+    for bad in (good[:-1], good + b"\0",
+                good[:6] + bytes([9]) + good[7:],              # more refs than 8
+                good[:4] + bytes([16]) + good[5:],             # entered above 15
+                good[:5] + bytes([2]) + good[6:],              # overhead not 0/1
+                good[:-4] + b"\1\0\0\0",                       # padding after the listed refs
+                good[:7] + b"\0\0\0\0" + good[11:]):           # a listed ref of 0
+        with pytest.raises(FrameError):
+            Crossing.decode(bad)
+    assert dir_for(MsgType.CROSSING) == Dir.DOOR_TO_CTRL and dir_for(MsgType.CROSSING_ACK) == Dir.CTRL_TO_DOOR
+    assert CrossingAck.decode(CrossingAck(0x1200, 1).encode()) == CrossingAck(0x1200, 1)
+    for bad in (b"", CrossingAck(0x1200, 1).encode() + b"\0"):
+        with pytest.raises(FrameError):
+            CrossingAck.decode(bad)
+    assert CredMode.from_name("face_group") == CredMode.FACE_GROUP == 6

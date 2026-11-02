@@ -288,3 +288,110 @@ def test_door_decisions_stay_inside_the_10ms_budget(env):
     times.sort()
     p99 = times[int(len(times) * 0.99)]
     assert p99 < DECISION_BUDGET_MS, f"p99 {p99:.2f} ms (median {statistics.median(times):.2f} ms)"
+
+
+def test_one_two_factor_code_signs_in_once_even_in_parallel(env):
+    store, ctl, client, panel, gid = env
+    secret = client.post("/api/me/mfa/setup").json()["secret"]
+    assert client.post("/api/me/mfa/confirm", json={"code": security.totp_now(secret)}).status_code == 200
+    pw = admin_password(store)
+    code = security.totp_now(secret, at=time.time() + 30)  # the next step: not yet spent, within the drift allowed
+
+    def attempt(_):
+        c = TestClient(client.app)
+        return c.post("/api/login", json={"username": "admin", "password": pw, "code": code}).status_code
+
+    with ThreadPoolExecutor(12) as pool:
+        codes = list(pool.map(attempt, range(12)))
+    assert codes.count(200) == 1, codes
+    # And a code already spent signing in cannot turn two-factor off.
+    assert client.post("/api/me/mfa/disable", json={"code": code}).status_code == 400
+
+
+def test_two_admins_demoting_each_other_at_once_leave_one_admin(env):
+    store, ctl, client, panel, gid = env
+    admin_id = store.q1("SELECT id FROM operators WHERE username='admin'")["id"]
+    for round_ in range(20):
+        name = f"second{round_}"
+        r = client.post("/api/operators", json={"username": name, "password": "second-admin-pw-1", "role": "admin"})
+        other_id = r.json()["id"]
+        other = TestClient(client.app)
+        assert other.post("/api/login", json={"username": name, "password": "second-admin-pw-1"}).status_code == 200
+        barrier = threading.Barrier(2)
+
+        def demote(c, target):
+            barrier.wait()
+            return c.patch(f"/api/operators/{target}", json={"role": "viewer"}).status_code
+
+        with ThreadPoolExecutor(2) as pool:
+            codes = list(pool.map(demote, (client, other), (other_id, admin_id)))
+        left = store.q1("SELECT COUNT(*) n FROM operators WHERE role='admin' AND active=1")["n"]
+        assert left >= 1, (round_, codes)
+        # Put things back for the next round: the first admin stays, the second goes.
+        store.x("UPDATE operators SET role='admin' WHERE id=?", (admin_id,))
+        client = TestClient(client.app)
+        assert client.post("/api/login", json={"username": "admin", "password": admin_password(store)}).status_code == 200
+        assert client.delete(f"/api/operators/{other_id}").status_code == 200
+
+
+def test_udp_decisions_run_off_the_event_loop_and_still_answer(env):
+    import asyncio
+    import socket
+    from lintel_server.controller import run_controller
+    from lintel_server.protocol import MsgType, open_frame
+    store, ctl, client, panel, gid = env
+    add(client, gid, "Dan", "2468")
+    slow = ctl.engine.decide_pin
+
+    def slow_decide(*a, **kw):  # a slow database, as a remote PostgreSQL can be
+        time.sleep(0.5)
+        return slow(*a, **kw)
+
+    ctl.engine.decide_pin = slow_decide
+
+    async def scenario():
+        task = asyncio.create_task(run_controller(ctl, "127.0.0.1", 0))
+        ctl.transport = None
+        started = time.time()
+        while ctl.transport is None:
+            assert time.time() - started < 5, "UDP listener did not start"
+            await asyncio.sleep(0.01)
+        port = getattr(ctl.transport, "transport", ctl.transport).get_extra_info("sockname")[1]
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setblocking(False)
+        sock.sendto(panel.frame(MsgType.PIN_REQ, bytes([4]) + b"2468".ljust(9, b"\x00")), ("127.0.0.1", port))
+        ticks, reply, loop = 0, None, asyncio.get_running_loop()
+        deadline = time.time() + 5
+        while reply is None and time.time() < deadline:
+            await asyncio.sleep(0.02)
+            ticks += 1  # the loop keeps running while the decision is being made
+            try:
+                reply = sock.recv(512)
+            except BlockingIOError:
+                pass
+        sock.close()
+        task.cancel()
+        return ticks, reply
+
+    ticks, reply = asyncio.run(scenario())
+    assert reply is not None, "no reply over UDP"
+    h, pt = open_frame(panel.key, panel.net, reply)
+    assert h.type == MsgType.PIN_RESP and resp(pt)[1] == Decision.GRANT
+    assert ticks >= 10, f"event loop was blocked during the decision ({ticks} ticks in 0.5 s)"
+
+
+def test_live_feed_wakes_at_once_when_another_thread_publishes():
+    import asyncio
+    hub = web.Hub()
+
+    async def scenario():
+        q = asyncio.Queue()
+        hub.attach(q)
+        threading.Timer(0.05, hub.publish, args=({"type": "ping"},)).start()
+        start = time.perf_counter()
+        msg = await asyncio.wait_for(q.get(), timeout=5)
+        hub.detach(q)
+        return msg, time.perf_counter() - start
+
+    msg, waited = asyncio.run(scenario())
+    assert msg == {"type": "ping"} and waited < 1.0, waited

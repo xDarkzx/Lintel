@@ -9,7 +9,7 @@ import hmac
 import io
 import json
 import secrets
-import sqlite3
+import struct
 import time
 from datetime import datetime
 from pathlib import Path
@@ -23,7 +23,7 @@ from pydantic import BaseModel, Field
 from . import adopt, notify
 from .controller import Controller, photo_key
 from .photos import stamp_photo
-from .protocol import COMMANDS, SiteMode
+from .protocol import COMMANDS, CredMode, SiteMode
 from .security import (SECURITY_HEADERS, BodyLimit, LoginThrottle, totp_new_secret, totp_uri, totp_verify)
 from .store import Store, check_password, hash_password
 
@@ -31,6 +31,7 @@ STATIC = Path(__file__).parent / "static"
 SESSION_S = 12 * 3600
 IDLE_S = 30 * 60
 WS_RECHECK_S = 30  # the live feed re-checks its session at least this often
+PENDING_TOTP_S = 10 * 60  # a two-factor secret shown at setup must be confirmed within this
 COOKIE = "__Host-lintel_session"  # HTTPS only, host-locked, path=/
 MAX_IMAGE_PIXELS = 24_000_000
 # A PIN entry's face counts as someone else only when it is clearly a face
@@ -54,13 +55,42 @@ class Hub:
 
     def __init__(self) -> None:
         self.queues: set[asyncio.Queue] = set()
+        self._loops: dict[asyncio.Queue, asyncio.AbstractEventLoop] = {}
+
+    def attach(self, q: asyncio.Queue) -> None:
+        """Registers a live feed's queue; call from the feed's own event loop."""
+        self._loops[q] = asyncio.get_running_loop()
+        self.queues.add(q)
+
+    def detach(self, q: asyncio.Queue) -> None:
+        self.queues.discard(q)
+        self._loops.pop(q, None)
 
     def publish(self, msg: dict[str, Any]) -> None:
+        # Called from API worker threads, the UDP worker and the tailgating
+        # analysis as well as the event loop. asyncio queues are not thread-safe:
+        # put directly from a foreign thread, a waiting feed may not wake until
+        # its next timeout. So hand the put to the queue's own loop.
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
         for q in list(self.queues):
-            try:
-                q.put_nowait(msg)
-            except asyncio.QueueFull:
-                pass
+            loop = self._loops.get(q)
+            if loop is None or loop is running:
+                self._put(q, msg)
+            else:
+                try:
+                    loop.call_soon_threadsafe(self._put, q, msg)
+                except RuntimeError:
+                    pass  # that feed's loop has closed; it is going away
+
+    @staticmethod
+    def _put(q: asyncio.Queue, msg: dict[str, Any]) -> None:
+        try:
+            q.put_nowait(msg)
+        except asyncio.QueueFull:
+            pass
 
 
 # ---- request models ----------------------------------------------------------
@@ -99,7 +129,7 @@ class DoorPatch(BaseModel):
     name: str | None = None
     area: str | None = None
     unlock_ms: int | None = Field(None, ge=1000, le=30000)
-    credential_mode: str | None = Field(None, pattern="^(pin|card|card_or_pin|card_and_pin|face|face_and_pin)$")
+    credential_mode: str | None = Field(None, pattern="^(pin|card|card_or_pin|card_and_pin|face|face_and_pin|face_group)$")
     groups: list[int] | None = None
 
 
@@ -300,11 +330,18 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
     def session_token(request: Request) -> str | None:
         return request.cookies.get(COOKIE) or request.cookies.get("lintel_session")
 
+    def mfa_blocked(op: dict) -> bool:
+        """Enforced on the server, not only in the console: until an admin turns
+        on two-factor sign-in, the only thing their session can do is that."""
+        return op["role"] == "admin" and not op["totp_secret"] and store.setting("require_admin_mfa") == "1"
+
     def need(role: str):
         def dep(request: Request) -> dict:
             op = operator_from_token(session_token(request))
             if op is None:
                 raise HTTPException(401, "not signed in")
+            if mfa_blocked(op) and not request.url.path.startswith("/api/me"):
+                raise HTTPException(403, "two-factor sign-in is required for admins; turn it on under your account")
             if ROLES[op["role"]] < ROLES[role]:
                 raise HTTPException(403, f"{role} role required")
             return op
@@ -330,9 +367,10 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
             if not body.code:
                 return {"mfa_required": True}
             step = totp_verify(store.totp_secret(r["id"], r["totp_secret"]), body.code)
-            ok = step is not None and step > r["totp_last_step"]  # each code works once
-            if ok:
-                store.x("UPDATE operators SET totp_last_step=? WHERE id=?", (step, r["id"]))
+            # Each code works once. Checked and spent in one statement, so two
+            # sign-ins racing with the same code cannot both succeed.
+            ok = step is not None and store.x("UPDATE operators SET totp_last_step=? WHERE id=? AND totp_last_step<?",
+                                              (step, r["id"], step)) == 1
         if not ok:
             store.journal("operator.login_failed", operator=body.username, detail=f"bad credentials from {ip}")
             if throttle.fail(*keys):
@@ -362,7 +400,8 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
         if op["totp_secret"]:
             raise HTTPException(409, "two-factor sign-in is already on")
         secret = totp_new_secret()
-        store.set_setting(f"pending_totp:{op['id']}", secret)
+        # Stamped, so a secret shown but never confirmed stops being usable.
+        store.set_setting(f"pending_totp:{op['id']}", f"{int(time.time())}:{secret}")
         uri = totp_uri(secret, op["username"])
         svg = ""
         try:
@@ -376,8 +415,10 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
 
     @app.post("/api/me/mfa/confirm")
     def mfa_confirm(body: CodeIn, op: dict = Depends(viewer)) -> dict:
-        secret = store.setting(f"pending_totp:{op['id']}")
-        step = totp_verify(secret, body.code) if secret else None
+        made, _, secret = store.setting(f"pending_totp:{op['id']}").partition(":")
+        if not secret or not made.isdigit() or time.time() - int(made) > PENDING_TOTP_S:
+            raise HTTPException(400, "two-factor setup has expired; start it again")
+        step = totp_verify(secret, body.code)
         if step is None:
             raise HTTPException(400, "that code does not match; check the time on your phone")
         store.x("UPDATE operators SET totp_secret=?, totp_last_step=? WHERE id=?",
@@ -388,7 +429,10 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
 
     @app.post("/api/me/mfa/disable")
     def mfa_disable(body: CodeIn, op: dict = Depends(viewer)) -> dict:
-        if not op["totp_secret"] or totp_verify(store.totp_secret(op["id"], op["totp_secret"]), body.code) is None:
+        step = totp_verify(store.totp_secret(op["id"], op["totp_secret"]), body.code) if op["totp_secret"] else None
+        # The code is spent like a sign-in code, so one seen over a shoulder cannot be reused here.
+        if step is None or store.x("UPDATE operators SET totp_last_step=? WHERE id=? AND totp_last_step<?",
+                                   (step, op["id"], step)) != 1:
             raise HTTPException(400, "a current code is required to turn two-factor off")
         store.x("UPDATE operators SET totp_secret=NULL WHERE id=?", (op["id"],))
         journal(op, "operator.mfa_disabled", "two-factor sign-in turned off")
@@ -436,6 +480,9 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
         from .backup import BackupError, create_backup
         if not check_password(body.password, op["pw_hash"]):
             raise HTTPException(403, "password is wrong")
+        if store.db.dialect != "sqlite":
+            raise HTTPException(400, "this site runs on PostgreSQL: back it up with pg_dump or your provider's "
+                                     "snapshots, plus the data folder and master key")
 
         class _Proxy:  # sqlite backup through the store's lock
             def backup(self, dst):
@@ -534,7 +581,7 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
         try:
             store.x("INSERT INTO doors(id, name, area, key, unlock_ms, key_created) VALUES(?, ?, ?, ?, ?, ?)",
                     (body.id, body.name, body.area, store.seal_door_key(body.id, key), body.unlock_ms, time.time()))
-        except sqlite3.IntegrityError:
+        except store.IntegrityError:
             raise HTTPException(409, f"door {body.id} already exists")
         ctl.load_door(body.id)
         journal(op, "door.created", f"door {body.id} '{body.name}' created", door_id=body.id)
@@ -575,6 +622,10 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
     @app.patch("/api/doors/{door_id}")
     def patch_door(door_id: int, body: DoorPatch, op: dict = Depends(admin)) -> dict:
         fields = body.model_dump(exclude_none=True)
+        if fields.get("credential_mode") == "face_group" and store.q1("SELECT 1 FROM devices WHERE door_id=?",
+                                                                       (door_id,)):
+            # Keypads refuse walk-through mode in every heartbeat reply and would drop offline.
+            raise HTTPException(409, "a keypad is adopted into this door; walk-through needs a Lintel Vision unit")
         groups_ = fields.pop("groups", None)
         if groups_ is not None:
             store.x("DELETE FROM access_group_doors WHERE door_id=?", (door_id,))
@@ -623,7 +674,7 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
         try:
             sid = store.x("INSERT INTO schedules(name, observe_holidays) VALUES(?, ?)",
                           (body.name, int(body.observe_holidays)))
-        except sqlite3.IntegrityError:
+        except store.IntegrityError:
             raise HTTPException(409, "schedule name already used")
         write_windows(sid, body.windows)
         journal(op, "schedule.created", f"schedule '{body.name}' created")
@@ -641,7 +692,7 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
     def del_schedule(sid: int, op: dict = Depends(admin)) -> dict:
         try:
             store.x("DELETE FROM schedules WHERE id=?", (sid,))
-        except sqlite3.IntegrityError:
+        except store.IntegrityError:
             raise HTTPException(409, "schedule is used by an access group")
         journal(op, "schedule.deleted", f"schedule {sid} deleted")
         return {"ok": True}
@@ -658,7 +709,7 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
             raise HTTPException(422, "not a real date")
         try:
             hid = store.x("INSERT INTO holidays(day, name) VALUES(?, ?)", (body.day, body.name))
-        except sqlite3.IntegrityError:
+        except store.IntegrityError:
             raise HTTPException(409, "that date is already a holiday")
         journal(op, "schedule.holiday_added", f"{body.day} {body.name}")
         return {"id": hid}
@@ -692,7 +743,7 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
         try:
             gid = store.x("INSERT INTO access_groups(name, schedule_id) VALUES(?, ?)", (body.name, body.schedule_id))
             write_group_doors(gid, body.doors)
-        except sqlite3.IntegrityError:
+        except store.IntegrityError:
             raise HTTPException(409, "name in use, or unknown schedule/door")
         journal(op, "group.created", f"access group '{body.name}' created")
         return {"id": gid}
@@ -702,7 +753,7 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
         try:
             store.x("UPDATE access_groups SET name=?, schedule_id=? WHERE id=?", (body.name, body.schedule_id, gid))
             write_group_doors(gid, body.doors)
-        except sqlite3.IntegrityError:
+        except store.IntegrityError:
             raise HTTPException(409, "name in use, or unknown schedule/door")
         journal(op, "group.updated", f"access group '{body.name}' updated")
         return {"ok": True}
@@ -715,7 +766,7 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
 
     # ---- cardholders -----------------------------------------------------------------------
 
-    def cardholder_out(r: sqlite3.Row) -> dict:
+    def cardholder_out(r: Any) -> dict:
         d = dict(r)
         d["has_pin"] = d.pop("pin_tag") is not None
         d["has_duress"] = d.pop("duress_tag") is not None
@@ -731,8 +782,9 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
     @app.get("/api/cardholders")
     def cardholders(q: str = "", op: dict = Depends(viewer)) -> list[dict]:
         like = f"%{q}%"
-        rows = store.q("SELECT * FROM cardholders WHERE first_name LIKE ? OR last_name LIKE ? OR department LIKE ? "
-                       "OR email LIKE ? ORDER BY last_name, first_name", (like, like, like, like))
+        rows = store.q("SELECT * FROM cardholders WHERE lower(first_name) LIKE lower(?) OR lower(last_name) LIKE lower(?) "
+                       "OR lower(department) LIKE lower(?) OR lower(email) LIKE lower(?) ORDER BY last_name, first_name",
+                       (like, like, like, like))
         return [cardholder_out(r) for r in rows]
 
     def check_pins(pin: str | None, duress: str | None, exclude: int | None = None) -> None:
@@ -744,8 +796,11 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
             if len(set(p)) == 1 or p in "0123456789" or p in "9876543210":
                 raise HTTPException(400, f"PIN {p[:1]}*** is too easy to guess")
             tag = store.pin_tag(p)
-            clash = store.q1("SELECT id FROM cardholders WHERE (pin_tag=? OR duress_tag=?) AND id IS NOT ?",
-                             (tag, tag, exclude))
+            if exclude is None:
+                clash = store.q1("SELECT id FROM cardholders WHERE pin_tag=? OR duress_tag=?", (tag, tag))
+            else:
+                clash = store.q1("SELECT id FROM cardholders WHERE (pin_tag=? OR duress_tag=?) AND id <> ?",
+                                 (tag, tag, exclude))
             if clash:
                 raise HTTPException(409, "that PIN is already assigned; choose another")
 
@@ -1006,6 +1061,61 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
         ctl.hold_face(door_id, ref, (cid, score, time.time(), body, None))
         return {"ok": True, "face": True}
 
+    @app.post("/api/door/{door_id}/walk/face", dependencies=[Depends(controller_auth)])
+    async def walk_face(door_id: int, request: Request) -> dict:
+        """One tracked person's face at a Lintel Vision door: the colour crop and
+        the matching depth patch, signed by the unit. Liveness is judged here
+        from the depth, then the face is matched; the result is held for the
+        CredReq that cites the same ref, exactly as for a keypad's face."""
+        from starlette.concurrency import run_in_threadpool
+        from .depth import judge_depth, read_depth_patch
+        from .faces import FaceError
+        link = ctl.doors.get(door_id)
+        if link is None:
+            raise HTTPException(404, "unknown door")
+        body = await request.body()
+        if not 4 < len(body) <= 2_000_000:
+            raise HTTPException(413, "face upload too large")
+        try:
+            ref = int(request.headers["x-lintel-req"])
+            mac = bytes.fromhex(request.headers["x-lintel-mac"])
+        except (KeyError, ValueError):
+            raise HTTPException(400, "missing signature")
+        (n,) = struct.unpack_from("<I", body)
+        if not 0 < n < len(body) - 4:
+            raise HTTPException(400, "malformed face upload")
+        jpeg, depth_png = body[4:4 + n], body[4 + n:]
+        want = hmac.new(photo_key(link.key), f"walkface:{door_id}:{ref}:".encode() + hashlib.sha256(jpeg).digest()
+                        + hashlib.sha256(depth_png).digest(), hashlib.sha256).digest()
+        if not hmac.compare_digest(mac, want) or ref == 0:
+            raise HTTPException(403, "bad signature")
+        if ctl.engine.door_mode(door_id) != CredMode.FACE_GROUP:
+            raise HTTPException(409, "door is not in walk-through mode")
+        check_image(jpeg)
+        try:
+            live, why = judge_depth(read_depth_patch(depth_png))
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        if not live:
+            # Never matched: a photo of an employee must not even be compared.
+            ctl.hold_face(door_id, ref, (None, 0.0, time.time(), jpeg, "not a live face"))
+            ev = store.journal("face.spoof", door_id=door_id, detail=f"face refused at {link.name}: {why}")
+            if ctl.on_face_evidence:
+                ctl.on_face_evidence(ev, jpeg, link.name, "POSSIBLE SPOOF")
+            al = store.raise_alarm(2, "face.spoof", f"Possible face spoof at {link.name}", door_id=door_id,
+                                   event_seq=ev["seq"])
+            hub.publish({"type": "event", "event": ev})
+            hub.publish({"type": "alarm", "alarm": al})
+            return {"ok": True, "face": False}
+        try:
+            r = await run_in_threadpool(need_faces().analyse, jpeg)
+        except FaceError as e:
+            ctl.hold_face(door_id, ref, (None, 0.0, time.time(), jpeg, str(e)))
+            return {"ok": True, "face": False}
+        cid, score = need_faces().best_match(r.embedding, templates())
+        ctl.hold_face(door_id, ref, (cid, score, time.time(), jpeg, None))
+        return {"ok": True, "face": True}
+
     # ---- events, reports, journal ----------------------------------------------------------
 
     def event_query(limit: int, before: int | None, door: int | None, kind: str | None, cardholder: int | None,
@@ -1092,7 +1202,7 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
         try:
             oid = store.x("INSERT INTO operators(username, pw_hash, role, created) VALUES(?, ?, ?, ?)",
                           (body.username, hash_password(body.password), body.role, time.time()))
-        except sqlite3.IntegrityError:
+        except store.IntegrityError:
             raise HTTPException(409, "username taken")
         journal(op, "operator.created", f"operator '{body.username}' ({body.role}) created")
         return {"id": oid}
@@ -1105,40 +1215,48 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
     def del_operator(oid: int, op: dict = Depends(admin)) -> dict:
         if oid == op["id"]:
             raise HTTPException(400, "you cannot delete yourself")
-        target = store.q1("SELECT * FROM operators WHERE id=?", (oid,))
-        if target is None:
-            raise HTTPException(404, "no such operator")
-        if target["role"] == "admin" and admins_left(oid) == 0:
-            raise HTTPException(409, "cannot remove the last admin")
-        store.x("DELETE FROM operators WHERE id=?", (oid,))
+        # Check and change under the write lock: two admins removing each other
+        # at the same moment must not both see the other as still there.
+        with store.db.transaction():
+            target = store.q1("SELECT * FROM operators WHERE id=?", (oid,))
+            if target is None:
+                raise HTTPException(404, "no such operator")
+            if target["role"] == "admin" and admins_left(oid) == 0:
+                raise HTTPException(409, "cannot remove the last admin")
+            store.x("DELETE FROM operators WHERE id=?", (oid,))
         journal(op, "operator.deleted", f"operator '{target['username']}' deleted")
         return {"ok": True}
 
     @app.patch("/api/operators/{oid}")
     def patch_operator(oid: int, body: OperatorPatch, op: dict = Depends(admin)) -> dict:
-        target = store.q1("SELECT * FROM operators WHERE id=?", (oid,))
-        if target is None:
-            raise HTTPException(404, "no such operator")
-        losing_admin = target["role"] == "admin" and (
-            (body.role is not None and body.role != "admin") or body.active is False)
-        if losing_admin and admins_left(oid) == 0:
-            raise HTTPException(409, "cannot demote or disable the last admin")
-        changed = []
-        if body.role is not None and body.role != target["role"]:
-            store.x("UPDATE operators SET role=? WHERE id=?", (body.role, oid))
-            changed.append(f"role {target['role']} -> {body.role}")
-        if body.active is not None and int(body.active) != target["active"]:
-            store.x("UPDATE operators SET active=? WHERE id=?", (int(body.active), oid))
-            changed.append("enabled" if body.active else "disabled")
-        if body.password:
-            store.x("UPDATE operators SET pw_hash=? WHERE id=?", (hash_password(body.password), oid))
-            changed.append("password reset")
-        if body.reset_mfa:
-            store.x("UPDATE operators SET totp_secret=NULL WHERE id=?", (oid,))
-            changed.append("two-factor reset")
+        new_hash = hash_password(body.password) if body.password else None  # slow: not under the lock
+        # Check and change under the write lock: two admins demoting each other
+        # at the same moment must not both see the other as still an admin.
+        with store.db.transaction():
+            target = store.q1("SELECT * FROM operators WHERE id=?", (oid,))
+            if target is None:
+                raise HTTPException(404, "no such operator")
+            losing_admin = target["role"] == "admin" and (
+                (body.role is not None and body.role != "admin") or body.active is False)
+            if losing_admin and admins_left(oid) == 0:
+                raise HTTPException(409, "cannot demote or disable the last admin")
+            changed = []
+            if body.role is not None and body.role != target["role"]:
+                store.x("UPDATE operators SET role=? WHERE id=?", (body.role, oid))
+                changed.append(f"role {target['role']} -> {body.role}")
+            if body.active is not None and int(body.active) != target["active"]:
+                store.x("UPDATE operators SET active=? WHERE id=?", (int(body.active), oid))
+                changed.append("enabled" if body.active else "disabled")
+            if new_hash:
+                store.x("UPDATE operators SET pw_hash=? WHERE id=?", (new_hash, oid))
+                changed.append("password reset")
+            if body.reset_mfa:
+                store.x("UPDATE operators SET totp_secret=NULL WHERE id=?", (oid,))
+                changed.append("two-factor reset")
+            if changed:
+                # Any change to an account ends its sessions.
+                store.x("DELETE FROM sessions WHERE operator_id=?", (oid,))
         if changed:
-            # Any change to an account ends its sessions.
-            store.x("DELETE FROM sessions WHERE operator_id=?", (oid,))
             journal(op, "operator.updated", f"'{target['username']}': {', '.join(changed)}")
         return {"ok": True}
 
@@ -1505,6 +1623,9 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
             store.journal("device.adopt_failed", operator=op["username"], detail=f"{serial}: wrong pairing code")
             raise HTTPException(400, "pairing code does not match the code on the panel")
         door = store.q1("SELECT * FROM doors WHERE id=?", (body.door_id,))
+        if door is not None and door["credential_mode"] == "face_group":
+            raise HTTPException(409, "this is a walk-through door; a keypad cannot run it (it needs a Lintel Vision "
+                                     "unit)")
         if door is not None and store.q1("SELECT 1 FROM devices WHERE door_id=?", (body.door_id,)):
             raise HTTPException(409, f"door {body.door_id} already has a device")
         key = secrets.token_bytes(16)
@@ -1516,7 +1637,8 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
             store.x("UPDATE doors SET key=?, tx_ceiling=0, rx_highest=0 WHERE id=?",
                     (store.seal_door_key(body.door_id, key), body.door_id))
         for g in body.groups:
-            store.x("INSERT OR IGNORE INTO access_group_doors(group_id, door_id) VALUES(?, ?)", (g, body.door_id))
+            store.x("INSERT INTO access_group_doors(group_id, door_id) VALUES(?, ?) ON CONFLICT DO NOTHING",
+                    (g, body.door_id))
         store.x("UPDATE devices SET door_id=?, adopted_at=? WHERE serial=?", (body.door_id, time.time(), serial))
         queue_blob(store.q1("SELECT * FROM devices WHERE serial=?", (serial,)), body.door_id, key)
         ctl.load_door(body.door_id)
@@ -1579,12 +1701,16 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
             await sock.close(code=4403)  # cross-site WebSocket hijacking
             return
         token = sock.cookies.get(COOKIE) or sock.cookies.get("lintel_session")
-        if operator_from_token(token) is None:
+        live_op = operator_from_token(token)
+        if live_op is None:
             await sock.close(code=4401)
+            return
+        if mfa_blocked(live_op):
+            await sock.close(code=4403)
             return
         await sock.accept()
         q: asyncio.Queue = asyncio.Queue(maxsize=500)
-        hub.queues.add(q)
+        hub.attach(q)
         try:
             while True:
                 try:
@@ -1601,7 +1727,7 @@ def create_app(store: Store, ctl: Controller, hub: Hub, udp_port: int, faces: An
         except (WebSocketDisconnect, RuntimeError):
             pass
         finally:
-            hub.queues.discard(q)
+            hub.detach(q)
 
     @app.get("/", response_class=HTMLResponse)
     def index() -> str:

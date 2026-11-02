@@ -69,6 +69,43 @@ key.
 Ports: 8443/tcp (HTTPS console and controller uploads) and 47800/udp (sealed keypad
 traffic).
 
+### PostgreSQL
+
+Set `LINTEL_DATABASE_URL` to use PostgreSQL instead of the default SQLite
+database. The PostgreSQL database stores relational data; photos, floor plans,
+the keyring and other site files remain under `server/data/`.
+
+```sh
+export LINTEL_DATABASE_URL='postgresql://lintel:<password>@db.example.net/lintel?sslmode=verify-full&sslrootcert=/run/secrets/postgres-ca.pem'
+cd server && docker compose up -d --build
+```
+
+Connections require TLS by default. Set `sslmode=verify-full` and provide the
+database CA certificate for production; mount that certificate read-only at
+`/run/secrets/postgres-ca.pem` in the container. An explicit `sslmode` in the URL is
+respected, including `disable`; use that only for a trusted local test database.
+The server creates and migrates an empty PostgreSQL schema on first start. It
+does not copy data from an existing SQLite database. Back up PostgreSQL with
+`pg_dump` or provider snapshots, and separately back up `server/data/` and the
+same master key used by the server.
+
+Run exactly one server per database. Each server keeps its own door message
+counters, so two would reuse AES-CCM nonces under the same door key; a second
+server refuses to start while the first holds the database.
+
+### Behind a reverse proxy
+
+Sign-in throttling locks by client address. Behind a reverse proxy every client
+arrives from the proxy's address, so one person's failed sign-ins would lock
+out everyone. Tell the server which proxy to trust for `X-Forwarded-For`:
+
+```sh
+export FORWARDED_ALLOW_IPS=10.0.0.2      # the proxy's address; comma-separated for several
+```
+
+Only list addresses you control: a trusted proxy can claim any client address.
+The default trusts only the server's own machine (`127.0.0.1`, `::1`).
+
 To run outside Docker, use a virtual environment:
 
 ```sh

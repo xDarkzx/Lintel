@@ -11,6 +11,9 @@ services:
       - ./data:/data
     environment:
       TZ: Pacific/Auckland
+      LINTEL_DATABASE_URL: ${LINTEL_DATABASE_URL:-}
+      # Behind a reverse proxy: its address, so sign-in throttling sees real clients (see BUILDING.md).
+      FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-127.0.0.1,::1}
       # Production: keep the master key out of ./data, as a Docker secret (see BUILDING.md).
       # LINTEL_MASTER_KEY_FILE: /run/secrets/lintel_master_key
     # secrets: [lintel_master_key]

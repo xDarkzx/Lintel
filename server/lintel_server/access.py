@@ -13,6 +13,8 @@ from .store import Store
 LOCKOUT_THRESHOLD = 3        # failed attempts in a row at one keypad
 LOCKOUT_BASE_S = 30          # first lockout; doubles on each repeat
 LOCKOUT_MAX_S = 15 * 60
+FAILURE_WINDOW_S = 5 * 60    # failures this recent count towards a lockout
+STRIKE_RESET_S = 60 * 60     # a quiet hour without failures resets the doubling
 ENROL_TTL_S = 60
 
 # Which combinations of factors each door mode accepts.
@@ -23,6 +25,8 @@ MODE_FACTORS: dict[CredMode, list[frozenset[str]]] = {
     CredMode.CARD_AND_PIN: [frozenset({"card", "pin"})],
     CredMode.FACE: [frozenset({"face"})],
     CredMode.FACE_AND_PIN: [frozenset({"face", "pin"})],
+    # Walk-through: each person by face, with a PIN on the unit as the fallback.
+    CredMode.FACE_GROUP: [frozenset({"face"}), frozenset({"pin"})],
 }
 
 
@@ -39,26 +43,31 @@ class Verdict:
 
 @dataclass
 class KeypadGuard:
-    """Brute-force protection for one door."""
-    failures: int = 0
+    """Brute-force protection for one door.
+
+    Failures are counted over a time window, and a correct credential does not
+    clear them: otherwise anyone holding one valid card or PIN (even a revoked
+    one) could guess between their own presentations and never be locked out.
+    The doubling fades only after a quiet period with no failures."""
+    failures: list[float] = field(default_factory=list)
     strikes: int = 0
     locked_until: float = 0.0
+    last_failure: float = 0.0
 
     def locked(self, now: float) -> int:
         return max(0, int(self.locked_until - now + 0.999))
 
     def fail(self, now: float) -> bool:
-        self.failures += 1
-        if self.failures < LOCKOUT_THRESHOLD:
+        if self.last_failure and now - self.last_failure >= STRIKE_RESET_S:
+            self.strikes = 0
+        self.last_failure = now
+        self.failures = [t for t in self.failures if now - t < FAILURE_WINDOW_S] + [now]
+        if len(self.failures) < LOCKOUT_THRESHOLD:
             return False
-        self.failures = 0
+        self.failures = []
         self.locked_until = now + min(LOCKOUT_MAX_S, LOCKOUT_BASE_S * 2 ** self.strikes)
         self.strikes += 1
         return True
-
-    def succeed(self) -> None:
-        self.failures = 0
-        self.strikes = 0
 
 
 def window_allows(days: int, start: int, end: int, weekday: int, minute: int) -> bool:
@@ -169,12 +178,15 @@ class AccessEngine:
             # credentials offered were right, so they do not count towards lockout.
             if failed in (Reason.NO_FACE, Reason.FACE_NOT_ENROLLED):
                 return Verdict(Decision.DENY, failed, dict(owner) if owner else None, method=method)
+            # At a walk-through door every passer-by's face is checked: one that
+            # matches nobody is not a guess, and must not lock the door for staff.
+            if failed == Reason.NO_MATCH and enforce_mode and self.door_mode(door_id) == CredMode.FACE_GROUP:
+                return Verdict(Decision.DENY, failed, None, method=method)
             started = guard.fail(now)
             return Verdict(Decision.DENY, Reason.LOCKED_OUT if started else failed, dict(owner) if owner else None,
                            lockout_s=guard.locked(now), lockout_started=started, method=method)
 
         ch = dict(self.store.q1("SELECT * FROM cardholders WHERE id=?", (ids[0],)))
-        guard.succeed()  # a recognised person is not a guessing attempt, even if refused below
 
         if not ch["active"] or (ch["valid_from"] and now < ch["valid_from"]) or (
                 ch["valid_until"] and now > ch["valid_until"]):
