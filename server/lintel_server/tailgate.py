@@ -153,6 +153,7 @@ class Session:
     total: int
     started: float
     frames: dict[int, tuple[int, bytes]] = field(default_factory=dict)  # index -> (ms, jpeg)
+    timer: threading.Timer | None = None  # analyses a burst whose frames never all arrive
 
 
 class WatchManager:
@@ -176,9 +177,9 @@ class WatchManager:
             s = self._sessions.get(key)
             if s is None:
                 s = self._sessions[key] = Session(door_id, door_name, event, total, time.time())
-                timer = threading.Timer(SESSION_TIMEOUT_S, self._finish, args=(key,))
-                timer.daemon = True
-                timer.start()
+                s.timer = threading.Timer(SESSION_TIMEOUT_S, self._finish, args=(key,))
+                s.timer.daemon = True
+                s.timer.start()
             if index in s.frames or total != s.total:
                 return False
             s.frames[index] = (ms, jpeg)
@@ -196,6 +197,10 @@ class WatchManager:
                     self._done.popitem(last=False)
         if s is None:
             return  # already analysed
+        if s.timer is not None:
+            # Finished early: release the timeout thread now rather than
+            # leaving one asleep per entry for SESSION_TIMEOUT_S.
+            s.timer.cancel()
         try:
             self.analyse(s)
         except Exception as e:  # surfaced in the journal, never silently passed

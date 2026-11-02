@@ -34,6 +34,8 @@ class MsgType(IntEnum):
     PIN_RESP = 9
     CRED_REQ = 10
     DIAG = 11
+    CROSSING = 12      # Lintel Vision: who crossed while the door was open
+    CROSSING_ACK = 13
 
 
 class Dir(IntEnum):
@@ -42,7 +44,8 @@ class Dir(IntEnum):
     BROADCAST = 2
 
 
-_UPLINK = {MsgType.ACCESS_REQ, MsgType.HEARTBEAT, MsgType.EVENT, MsgType.PIN_REQ, MsgType.CRED_REQ, MsgType.DIAG}
+_UPLINK = {MsgType.ACCESS_REQ, MsgType.HEARTBEAT, MsgType.EVENT, MsgType.PIN_REQ, MsgType.CRED_REQ, MsgType.DIAG,
+           MsgType.CROSSING}
 
 
 def dir_for(t: MsgType) -> Dir:
@@ -86,6 +89,8 @@ class CredMode(IntEnum):
     CARD_AND_PIN = 3
     FACE = 4
     FACE_AND_PIN = 5
+    # Walk-through (Lintel Vision only; the keypad core accepts up to FACE_AND_PIN).
+    FACE_GROUP = 6
 
     @staticmethod
     def from_name(name: str) -> "CredMode":
@@ -289,6 +294,53 @@ class CredReq:
         if bool(present & CRED_FACE) != bool(face_ref):
             raise FrameError("CredReq face reference")
         return CredReq(present, bytes(uid[:uid_len]), pin[:pin_len].decode(), face_ref)
+
+
+CROSSING_REFS_MAX = 8
+_CROSSING = struct.Struct("<IBBB" + "I" * CROSSING_REFS_MAX)
+
+
+@dataclass
+class Crossing:
+    """Sent by a Lintel Vision unit when its door closes: how many people went
+    in, and the face refs of the tracked people among them."""
+    passage: int
+    entered: int
+    overhead: bool  # the count came from the overhead camera
+    refs: tuple[int, ...]
+
+    def encode(self) -> bytes:
+        refs = list(self.refs) + [0] * (CROSSING_REFS_MAX - len(self.refs))
+        return _CROSSING.pack(self.passage, self.entered, int(self.overhead), len(self.refs), *refs)
+
+    @staticmethod
+    def decode(p: bytes) -> "Crossing":
+        if len(p) != _CROSSING.size:
+            raise FrameError("Crossing length")
+        passage, entered, overhead, n, *refs = _CROSSING.unpack(p)
+        if entered > 15 or overhead > 1 or n > CROSSING_REFS_MAX:
+            raise FrameError("Crossing counts")
+        if not all(refs[:n]) or any(refs[n:]):
+            raise FrameError("Crossing refs")
+        return Crossing(passage, entered, bool(overhead), tuple(refs[:n]))
+
+
+_CROSSING_ACK = struct.Struct("<IB")
+
+
+@dataclass
+class CrossingAck:
+    passage: int
+    unauthorised: int
+
+    def encode(self) -> bytes:
+        return _CROSSING_ACK.pack(self.passage, self.unauthorised)
+
+    @staticmethod
+    def decode(p: bytes) -> "CrossingAck":
+        if len(p) != _CROSSING_ACK.size:
+            raise FrameError("CrossingAck length")
+        return CrossingAck(*_CROSSING_ACK.unpack(p))
 
 
 class ReplayWindow:

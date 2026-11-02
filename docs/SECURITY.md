@@ -34,8 +34,11 @@ trusted only for its own door. The server is the only place decisions are made.
 | Rogue or cloned keypad adopted | Pairing code read from the physical screen; identity key mismatch on an adopted serial raises a P1 alarm | `test_identity_change_on_adopted_device_raises_alarm` |
 | Door key exposed during setup | Key sealed to the keypad's X25519 public key; never typed, logged or shown | `Adopt.GoldenBlobMatchesServer`, `test_discover_adopt_deliver_and_use` |
 | Rolling a keypad back to an old key | Monotonic adoption sequence | `SealOpenRoundTripAndTamper`, firmware `on_provision` |
-| PIN guessing at the door | 3 failures lock the keypad, doubling to 15 min; P1 alarm with photo | `test_bad_pin_then_lockout_and_alarm` |
+| PIN guessing at the door | 3 failures within 5 min lock the keypad, doubling to 15 min and fading after a quiet hour; a valid card or PIN between guesses does not reset the count; P1 alarm with photo | `test_bad_pin_then_lockout_and_alarm`, `test_a_valid_credential_between_guesses_does_not_reset_the_lockout`, `test_keypad_failures_expire_and_the_doubling_fades` |
 | Tailgating on someone else's entry | After a grant the keypad records the open door; more people than credentials, near the door, in two or more frames raises a P2 alarm with an outlined evidence photo | `test_tailgate.py` |
+| Someone walking through with a group at a walk-through door | Each tracked person is identified by face; when the door closes the Lintel Vision unit reports who crossed, and anyone not authorised (a stranger, an enrolled person without access, or a crossing tied to no face, such as one the overhead camera counted) raises a P1 alarm with their photo; the door stays in service | `test_a_stranger_behind_two_staff_raises_the_alarm`, `test_staff_without_access_following_is_named`, `test_overhead_counts_a_person_hidden_from_the_front_camera`, `test_a_retry_never_turns_a_granted_person_into_a_tailgater` |
+| A photo or screen held to a walk-through camera | The unit sends a depth patch with each face; the server refuses a flat one before any matching and raises a P2 alarm | `test_a_photo_held_up_opens_nothing`, `test_a_flat_tilted_photo_is_refused` |
+| Faking or replaying crossing reports | Crossing reports are sealed with the door key, inside the replay window, and refused at doors not in walk-through mode | `test_a_replayed_crossing_is_dropped`, `test_a_crossing_at_a_door_not_in_walk_through_mode_is_rejected` |
 | Faking or hiding door frames | Each frame is signed by the keypad with its index, burst length and capture time; a relaying controller cannot add, drop or reorder frames, and missing frames are reported | `test_frames_are_signed_ordered_and_bound_to_a_grant`, `test_missing_frames_are_analysed_after_the_timeout` |
 | Enrolling a photo, screen or video as someone's face | Guided enrolment judged on the server: anti-spoofing models on every frame, head-turn steps in a random order, the same face throughout; templates only when every step passes | `test_enrolment.py` |
 | A shared or stolen PIN | On PIN doors, a clear face unlike every face enrolled for that PIN raises a P3 alarm; face + PIN doors refuse it outright | `test_someone_else_using_a_pin_raises_an_alarm`, `test_face_and_pin_door_needs_the_pin_owners_face` |
@@ -44,7 +47,9 @@ trusted only for its own door. The server is the only place decisions are made.
 | Stolen database | PINs and card UIDs stored as HMAC tags keyed outside the database; door keys, two-factor secrets, face templates and the webhook URL encrypted (AES-256-GCM, envelope) and bound to their row; deleted values zeroed and pre-encryption leftovers scrubbed from disk | `test_vault.py` |
 | Editing history | HMAC-SHA256 hash chain; photo hashes are chained too | `test_journal_detects_tampering`, `Audit.*` |
 | Operator password guessing | 5 failures lock name and address for 15 min with an alarm; constant-time for unknown users | `test_operator_two_factor_and_login_lockout` |
-| Stolen operator password | TOTP second factor, single-use codes, optional admin enforcement | `test_operator_two_factor_and_login_lockout` |
+| Stolen operator password | TOTP second factor; each code spent atomically, so parallel sign-ins cannot share one; setup secrets expire after 10 min; optional admin enforcement on the server, not only in the console | `test_operator_two_factor_and_login_lockout`, `test_one_two_factor_code_signs_in_once_even_in_parallel`, `test_required_admin_two_factor_is_enforced_by_the_server`, `test_an_unconfirmed_two_factor_secret_expires` |
+| Nonce reuse from two servers on one database | A second server refuses to start while the first holds the database (file lock or PostgreSQL advisory lock), and a server that loses its claim stops; door reloads and frame sends share one lock | `test_only_one_server_can_run_on_a_database`, `test_postgres_allows_one_server_per_database` |
+| Secrets readable by other users of the host | TLS key, controller token file, first-run admin password and secrets file are owner-only | `test_secret_files_are_readable_by_the_owner_only` |
 | Session theft, CSRF, clickjacking | `__Host-` HttpOnly SameSite=Strict cookie, Origin checks, 30 min idle timeout, CSP `frame-ancestors 'none'` | `test_cross_origin_writes_are_refused`, `test_security_headers_present` |
 | Server impersonation to controllers | Controllers pin the server certificate's SHA-256 | door controller `post()` |
 | Fake controller on the LAN | Controller endpoints require the site token; door photos also carry a per-door HMAC | `test_controller_endpoints_need_the_token` |
@@ -57,7 +62,7 @@ trusted only for its own door. The server is the only place decisions are made.
 | Malformed or forged protocol bytes | Every decoder and the frame and adoption openers are fuzzed with over half a million inputs under AddressSanitizer and UBSan | `Fuzz.*` |
 | Malicious uploads | Image dimension limit before decode, including keypad face images; 2–8 MB caps; JPEG/PNG only; floor plans re-encoded | `test_image_bomb_rejected_before_decoding` |
 | CSV formula injection | Exported cells starting with `= + - @` are neutralised | `test_csv_export_neutralises_formulas` |
-| Locking everyone out | The last admin cannot be deleted, demoted or disabled | `test_last_admin_cannot_be_removed_or_demoted` |
+| Locking everyone out | The last admin cannot be deleted, demoted or disabled, even by two admins acting at once | `test_last_admin_cannot_be_removed_or_demoted`, `test_two_admins_demoting_each_other_at_once_leave_one_admin` |
 | Losing the server | Encrypted backup (scrypt + AES-256-GCM); restore verifies the chain and refuses path escapes | `test_backup.py` |
 | Vulnerable dependencies | Pinned versions audited with `pip-audit` | CI |
 
@@ -74,6 +79,14 @@ trusted only for its own door. The server is the only place decisions are made.
   case. Tailgating detection counts people with a general person detector
   (YOLOX-S); it does not identify them, so it is not biometric processing of
   bystanders under the NZ Biometric Processing Privacy Code.
+- **Walk-through doors (Lintel Vision) are biometric processing of everyone
+  who approaches.** Deciding that a person is "unrecognised" means comparing
+  their face with the enrolled templates. The comparison runs on the server,
+  its result is discarded unless it raised an alarm, and no template is kept
+  for anyone who did not enrol; the photo of an unauthorised person is kept as
+  alarm evidence under the photo retention setting. Enrolled people need
+  notice and consent, and walk-through doors need a sign, under the NZ
+  Biometric Processing Privacy Code.
 - **RC522 cards are read by UID**, which inexpensive cards let an attacker
   clone. Use card + PIN, or NTAG 424 DNA cards with a PN532 reader (supported
   in `lintel_core/sdm`), where each tap is cryptographically fresh.
@@ -82,3 +95,13 @@ trusted only for its own door. The server is the only place decisions are made.
   or unassigning the door in the console voids the stolen key immediately.
 - **Truncating the newest journal records** is not detectable from the chain
   alone; the console shows the head hash so it can be recorded elsewhere.
+- **Anyone can lock an operator's name for 15 minutes** with five wrong
+  passwords. This is deliberate: locking only by address would let guesses
+  spread over many addresses go on forever. Behind a reverse proxy, set
+  `FORWARDED_ALLOW_IPS` (see [BUILDING.md](../BUILDING.md)) so one client's
+  failures do not lock out every address.
+- **Keypad lockouts and sign-in throttles are held in memory**, so restarting
+  the server clears them. Only one server runs per database, so they are never
+  split between servers.
+- **Card enrolment takes the first card tapped** at the chosen door within
+  60 seconds; the person enrolling should be at the door when they start it.

@@ -9,8 +9,8 @@ const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "
 const icon = (name, cls = "") => `<svg class="ic ${cls}"><use href="/static/icons.svg#i-${name}"/></svg>`;
 const DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 const MODES = ["Normal", "Lockdown", "Free access"];
-const MODE_LABEL = { pin: "PIN", card: "Card", card_or_pin: "Card or PIN", card_and_pin: "Card + PIN", face: "Face", face_and_pin: "Face + PIN" };
-const MODE_HINT = { face: "Convenience tier: a single camera cannot rule out a photo of a face.", face_and_pin: "Recommended secure biometric mode." };
+const MODE_LABEL = { pin: "PIN", card: "Card", card_or_pin: "Card or PIN", card_and_pin: "Card + PIN", face: "Face", face_and_pin: "Face + PIN", face_group: "Walk-through" };
+const MODE_HINT = { face: "Convenience tier: a single camera cannot rule out a photo of a face.", face_and_pin: "Recommended secure biometric mode.", face_group: "Lintel Vision doors: faces, groups, PIN fallback. Depth rules out photos; anyone else who walks through raises a P1 alarm." };
 let ME = null;
 
 async function api(path, opts = {}) {
@@ -316,6 +316,8 @@ function eventInfo(e) {
   if (k === "door.remote_unlock") return ["warn", "lock-access", "Remote unlock"];
   if (k === "door.passage") return ["ok", "door-enter", "Passage verified"];
   if (k === "door.tailgating") return ["bad", "users-group", "Tailgating"];
+  if (k === "door.unauthorised_person") return ["bad", "users-group", "Unauthorised person"];
+  if (k === "face.spoof") return ["bad", "alert-triangle", "Possible face spoof"];
   if (k === "watch.failed") return ["warn", "alert-triangle", "Door watch failed"];
   if (k.startsWith("device.")) return ["info", "cpu", "Device " + k.split(".")[1].replace(/_/g, " ")];
   if (k.startsWith("alarm.")) return ["warn", "bell", "Alarm " + k.split(".")[1]];
@@ -587,7 +589,7 @@ async function cardholderPanel(id) {
           await api(`/api/cardholders/${c.id}`, { method: "PATCH", body: { duress_pin: "" } }); reload();
         } else if (what === "card") {
           await api(`/api/cardholders/${c.id}/card/enrol`, { body: { door_id: Number($("#enrol-door").value) } });
-          $("#card-state").innerHTML = `<span style="color:var(--accent-text)">Waiting: tap the card at ${esc($("#enrol-door").selectedOptions[0].text)} within 60 s</span>`;
+          $("#card-state").innerHTML = `<span style="color:var(--accent-text)">Waiting: tap the card at ${esc($("#enrol-door").selectedOptions[0].text)} within 60 s. The first card tapped there is enrolled, so be at the door before you start.</span>`;
         } else if (what === "card-off") {
           await api(`/api/cardholders/${c.id}/card`, { method: "DELETE" }); reload();
         } else if (what === "face-off") {
@@ -1222,7 +1224,7 @@ async function securityPanel(nudge = false) {
         <form id="mfa-confirm" class="row2" style="align-items:end"><label class="field"><span>Code</span><input name="code" inputmode="numeric" maxlength="6" required></label><button class="btn primary">Turn on</button></form></div>`;
       $("#mfa-confirm").addEventListener("submit", async (e) => {
         e.preventDefault();
-        try { await api("/api/me/mfa/confirm", { body: { code: new FormData(e.target).get("code") } }); toast("Two-factor sign-in is on"); securityPanel(); } catch (err) { fail(err); }
+        try { await api("/api/me/mfa/confirm", { body: { code: new FormData(e.target).get("code") } }); toast("Two-factor sign-in is on"); if (!LIVE_STARTED) await boot(); securityPanel(); } catch (err) { fail(err); }
       });
     } catch (err) { fail(err); }
   });
@@ -1260,6 +1262,10 @@ async function boot() {
   $("#menu-user").textContent = ME.username;
   $("#menu-role").textContent = `${ME.role}${ME.mfa ? " · two-factor on" : ""}`;
   $$("[data-admin]").forEach((a) => a.classList.toggle("hidden", !isAdmin()));
-  connectWs(); setSys(); refreshBadges(); render();
+  // The server refuses everything else until an admin turns two-factor on, so go straight there.
+  if (ME.role === "admin" && !ME.mfa && ME.require_admin_mfa) { securityPanel(true); return; }
+  if (!LIVE_STARTED) { LIVE_STARTED = true; connectWs(); }
+  setSys(); refreshBadges(); render();
 }
+let LIVE_STARTED = false;
 fetch("/api/me", { credentials: "same-origin" }).then((r) => (r.ok ? boot() : showLogin()));

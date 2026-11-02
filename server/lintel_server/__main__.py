@@ -13,7 +13,7 @@ import uvicorn
 
 from .access import AccessEngine
 from .photos import stamp_photo
-from .security import ensure_tls
+from .security import ensure_tls, owner_only
 from .controller import Controller, run_controller
 from .store import Store
 from .web import Hub, create_app
@@ -46,6 +46,9 @@ async def maintenance(store: Store, app) -> None:
 
 async def serve(data: Path, host: str, http_port: int, udp_port: int) -> None:
     store = Store(data)
+    if not store.db.claim_server():
+        raise SystemExit("another Lintel server is already running on this database; run exactly one server "
+                         "per site (two would reuse door message counters)")
     hub = Hub()
     ctl = Controller(store, AccessEngine(store), hub.publish)
     ctl.load_doors()
@@ -87,6 +90,7 @@ async def serve(data: Path, host: str, http_port: int, udp_port: int) -> None:
     # Everything a door controller needs to talk to this server, in one file.
     (data / "controller.env").write_text(f"LINTEL_TOKEN={store.secrets.controller_token}\n"
                                          f"LINTEL_PIN_SHA256={fp}\n")
+    owner_only(data / "controller.env")  # it holds the site's controller token
     logging.getLogger("lintel").info("HTTPS certificate SHA-256 %s", fp)
     server = uvicorn.Server(uvicorn.Config(app, host=host, port=http_port, log_level="info", server_header=False,
                                            ssl_certfile=str(cert), ssl_keyfile=str(key)))

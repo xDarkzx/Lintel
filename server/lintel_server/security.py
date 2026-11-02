@@ -8,6 +8,7 @@ import datetime as dt
 import hashlib
 import hmac
 import ipaddress
+import os
 import secrets
 import socket
 import struct
@@ -191,6 +192,15 @@ async def _too_large(send) -> None:
 # ---- TLS ----------------------------------------------------------------------------------
 
 
+def owner_only(path: Path) -> None:
+    """Makes a secret file readable by its owner only (where the OS has Unix
+    permissions; Windows keeps the folder's access list)."""
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
 def ensure_tls(directory: Path) -> tuple[Path, Path, str]:
     """Creates a long-lived self-signed P-256 certificate on first run.
     Returns (cert, key, sha256 fingerprint). Controllers pin the fingerprint."""
@@ -212,6 +222,7 @@ def ensure_tls(directory: Path) -> tuple[Path, Path, str]:
         key_p.write_bytes(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
                                             serialization.NoEncryption()))
         cert_p.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    owner_only(key_p)  # every start, so a key made by an older version is tightened too
     cert = x509.load_pem_x509_certificate(cert_p.read_bytes())
     fp = cert.fingerprint(hashes.SHA256()).hex()
     return cert_p, key_p, fp

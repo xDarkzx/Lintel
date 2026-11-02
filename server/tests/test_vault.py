@@ -116,15 +116,15 @@ def test_an_older_plaintext_database_is_encrypted_on_upgrade(tmp_path):
 
 def test_deleted_records_do_not_linger_on_disk(env):
     store, ctl, client, panel, gid = env
-    marker = "Zyxwvutsrq-Deleted-Person"
+    # The marker sits in a field the audit trail does not record, so only the
+    # cardholder row ever held it.
+    marker = "zyxwvutsrq.deleted@example.org"
     for i in range(20):  # others on the same database page, as on a real site
         client.post("/api/cardholders", json={"first_name": f"Colleague{i}", "last_name": "x" * 30})
-    cid = client.post("/api/cardholders", json={"first_name": marker}).json()["id"]
+    cid = client.post("/api/cardholders", json={"first_name": "Leaver", "email": marker}).json()["id"]
     store._db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    assert marker.encode() in raw_files(store)
     assert client.delete(f"/api/cardholders/{cid}").status_code == 200
-    events = store.q("SELECT seq FROM events WHERE detail LIKE ?", (f"%{marker}%",))
-    for e in events:  # the audit trail keeps its own record; scrub those rows for this check
-        store.x("UPDATE events SET detail='' WHERE seq=?", (e["seq"],))
     assert marker.encode() not in raw_files(store)
 
 

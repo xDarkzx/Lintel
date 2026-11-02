@@ -209,14 +209,38 @@ def test_photo_upload_is_signed_stamped_and_chained(env):
     assert denied["photo"]
 
 
+def drop_append_only_guards(store):
+    """What an attacker with raw access to the database can do: remove the
+    database's own rules. The hash chain must still catch what follows."""
+    if store.db.dialect == "sqlite":
+        store.db.script("DROP TRIGGER events_no_delete; DROP TRIGGER events_no_rewrite;")
+    else:
+        store.db.script("DROP TRIGGER events_append_only ON events; DROP TRIGGER events_no_truncate ON events;")
+
+
 def test_journal_detects_tampering(env):
     store, ctl, client, panel, gid = env
     add(client, gid, "Dan", "2468")
     panel.pin("2468")
     assert client.get("/api/journal/verify").json()["ok"]
+    drop_append_only_guards(store)
     store.x("UPDATE events SET detail='nothing to see' WHERE kind='access.granted'")
     v = client.get("/api/journal/verify").json()
     assert not v["ok"] and v["why"] == "record altered"
+
+
+def test_the_database_refuses_to_rewrite_or_delete_history(env):
+    store, ctl, client, panel, gid = env
+    add(client, gid, "Dan", "2468")
+    panel.pin("2468")
+    for sql in ("UPDATE events SET detail='nothing to see' WHERE kind='access.granted'",
+                "UPDATE events SET ts=0 WHERE seq=1",
+                "DELETE FROM events WHERE kind='access.granted'"):
+        with pytest.raises(Exception, match="audit records cannot be"):
+            store.x(sql)
+    # The one field that may change: retention clears a photo reference.
+    store.x("UPDATE events SET photo=NULL WHERE seq=1")
+    assert client.get("/api/journal/verify").json()["ok"]
 
 
 def test_roles_and_pin_rules(env):
@@ -272,3 +296,140 @@ def test_operator_two_factor_and_login_lockout(env):
     assert attacker.post("/api/login", json={"username": "admin", "password": "guess"}).status_code == 401
     assert attacker.post("/api/login", json={"username": "admin", "password": pw}).status_code == 429
     assert any(a["kind"] == "operator.bruteforce" for a in client.get("/api/alarms").json())
+
+
+def test_changing_a_missing_door_or_floor_is_not_found(env):
+    store, ctl, client, panel, gid = env
+    # An insert first, so a stale "last inserted id" would look like success.
+    client.post("/api/floors", json={"name": "Ground"})
+    assert client.post("/api/doors/9/rekey").status_code == 404
+    assert client.patch("/api/floors/999", json={"name": "Roof"}).status_code == 404
+
+
+def test_a_valid_credential_between_guesses_does_not_reset_the_lockout(env):
+    store, ctl, client, panel, gid = env
+    ch = add(client, gid, "Dan", "2468")
+    client.patch(f"/api/cardholders/{ch['id']}", json={"active": False})  # even a revoked PIN
+    for _ in range(LOCKOUT_THRESHOLD - 1):
+        assert resp(panel.pin("1111"))[2] == Reason.BAD_PIN
+        assert resp(panel.pin("2468"))[2] == Reason.REVOKED
+    assert resp(panel.pin("1111"))[2] == Reason.LOCKED_OUT
+
+
+def test_keypad_failures_expire_and_the_doubling_fades():
+    from lintel_server.access import FAILURE_WINDOW_S, LOCKOUT_BASE_S, STRIKE_RESET_S, KeypadGuard
+    g = KeypadGuard()
+    for i in range(LOCKOUT_THRESHOLD - 1):
+        assert not g.fail(1000 + i)
+    assert not g.fail(1000 + FAILURE_WINDOW_S + 10)  # the earlier ones have expired
+    t = 5000.0
+    for _ in range(LOCKOUT_THRESHOLD):
+        g.fail(t)
+    assert g.locked(t) == LOCKOUT_BASE_S
+    t += LOCKOUT_BASE_S
+    for _ in range(LOCKOUT_THRESHOLD):
+        g.fail(t)
+    assert g.locked(t) == 2 * LOCKOUT_BASE_S  # doubles on a repeat
+    t += STRIKE_RESET_S + 2 * LOCKOUT_BASE_S
+    for _ in range(LOCKOUT_THRESHOLD):
+        g.fail(t)
+    assert g.locked(t) == LOCKOUT_BASE_S  # a quiet hour starts it over
+
+
+def test_a_valid_credential_between_guesses_does_not_reset_the_lockout(env):
+    store, ctl, client, panel, gid = env
+    ch = add(client, gid, "Dan", "2468")
+    client.patch(f"/api/cardholders/{ch['id']}", json={"active": False})  # even a revoked PIN
+    for _ in range(LOCKOUT_THRESHOLD - 1):
+        assert resp(panel.pin("1111"))[2] == Reason.BAD_PIN
+        assert resp(panel.pin("2468"))[2] == Reason.REVOKED
+    assert resp(panel.pin("1111"))[2] == Reason.LOCKED_OUT
+
+
+def test_keypad_failures_expire_and_the_doubling_fades():
+    from lintel_server.access import FAILURE_WINDOW_S, LOCKOUT_BASE_S, STRIKE_RESET_S, KeypadGuard
+    g = KeypadGuard()
+    for i in range(LOCKOUT_THRESHOLD - 1):
+        assert not g.fail(1000 + i)
+    assert not g.fail(1000 + FAILURE_WINDOW_S + 10)  # the earlier ones have expired
+    t = 5000.0
+    for _ in range(LOCKOUT_THRESHOLD):
+        g.fail(t)
+    assert g.locked(t) == LOCKOUT_BASE_S
+    t += LOCKOUT_BASE_S
+    for _ in range(LOCKOUT_THRESHOLD):
+        g.fail(t)
+    assert g.locked(t) == 2 * LOCKOUT_BASE_S  # doubles on a repeat
+    t += STRIKE_RESET_S + 2 * LOCKOUT_BASE_S
+    for _ in range(LOCKOUT_THRESHOLD):
+        g.fail(t)
+    assert g.locked(t) == LOCKOUT_BASE_S  # a quiet hour starts it over
+
+
+def test_required_admin_two_factor_is_enforced_by_the_server(env):
+    from lintel_server.security import totp_now
+    store, ctl, client, panel, gid = env
+    assert client.patch("/api/settings", json={"require_admin_mfa": True}).status_code == 200
+    # The console's nudge is not the only gate: the API itself refuses.
+    assert client.get("/api/doors").status_code == 403
+    assert client.post("/api/operators", json={"username": "sneaky", "password": "a-long-password-1",
+                                               "role": "admin"}).status_code == 403
+    from starlette.websockets import WebSocketDisconnect
+    with pytest.raises(WebSocketDisconnect) as closed:
+        with client.websocket_connect("/ws") as ws:
+            ws.receive_json()
+    assert closed.value.code == 4403
+    # Turning two-factor on is still possible, and then everything works again.
+    assert client.get("/api/me").status_code == 200
+    secret = client.post("/api/me/mfa/setup").json()["secret"]
+    assert client.post("/api/me/mfa/confirm", json={"code": totp_now(secret)}).status_code == 200
+    assert client.get("/api/doors").status_code == 200
+
+
+def test_only_one_server_can_run_on_a_database(tmp_path):
+    from lintel_server.db import SQLiteDB
+    first, second = SQLiteDB(tmp_path / "lintel.db"), SQLiteDB(tmp_path / "lintel.db")
+    assert first.claim_server()
+    assert not second.claim_server(wait_s=0)  # a second server would reuse door message counters
+    first._server_lock.close()
+    assert second.claim_server()  # released when the holder goes away
+    second._server_lock.close()
+    first.close()
+    second.close()
+
+
+def test_sqlite_reports_rows_affected_not_a_stale_insert_id(tmp_path):
+    from lintel_server.db import SQLiteDB
+    db = SQLiteDB(tmp_path / "t.db")
+    db.x("CREATE TABLE t(id INTEGER PRIMARY KEY, v UNIQUE)")
+    assert db.x("INSERT INTO t(v) VALUES(?)", (1,)) == 1
+    assert db.x("INSERT INTO t(v) VALUES(?)", (2,)) == 2
+    assert db.x("UPDATE t SET v=9 WHERE id=99") == 0
+    assert db.x("DELETE FROM t WHERE id=99") == 0
+    assert db.x("INSERT INTO t(v) VALUES(?) ON CONFLICT DO NOTHING", (2,)) == 0
+    assert db.x("UPDATE t SET v=5 WHERE id=1") == 1
+    db.close()
+
+
+@pytest.mark.skipif(__import__("os").name == "nt", reason="Unix file permissions; Windows uses the folder's ACL")
+def test_secret_files_are_readable_by_the_owner_only(tmp_path):
+    import stat
+    from lintel_server.security import ensure_tls
+    Store(tmp_path)
+    cert, key, _ = ensure_tls(tmp_path / "tls")
+    for f in (key, tmp_path / "initial_admin.txt", tmp_path / "secrets.json"):
+        assert stat.S_IMODE(f.stat().st_mode) == 0o600, f
+
+
+def test_an_unconfirmed_two_factor_secret_expires(env):
+    import time
+    from lintel_server.security import totp_now
+    from lintel_server.web import PENDING_TOTP_S
+    store, ctl, client, panel, gid = env
+    secret = client.post("/api/me/mfa/setup").json()["secret"]
+    admin_id = store.q1("SELECT id FROM operators WHERE username='admin'")["id"]
+    stale = int(time.time()) - PENDING_TOTP_S - 1
+    store.set_setting(f"pending_totp:{admin_id}", f"{stale}:{secret}")  # shown too long ago
+    r = client.post("/api/me/mfa/confirm", json={"code": totp_now(secret)})
+    assert r.status_code == 400 and "expired" in r.json()["detail"]
+    assert store.q1("SELECT totp_secret FROM operators WHERE id=?", (admin_id,))["totp_secret"] is None
