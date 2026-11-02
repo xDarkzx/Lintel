@@ -273,7 +273,9 @@ function onLive(msg) {
     if (body && msg.event.kind.startsWith("access.")) { $(".empty-row", body)?.remove(); body.insertAdjacentHTML("afterbegin", eventRow(msg.event, true)); trimRows(body, 60); }
     if (msg.event.kind.startsWith("access.") && current === "monitor") refreshStats();
   }
+  if (msg.type === "event" && msg.event.door_id && /^access\.(granted|denied)$|^door\.unauthorised_person$/.test(msg.event.kind)) flashDoor(msg.event);
   if (msg.type === "photo") $$(`tr[data-seq="${msg.seq}"] .ph`).forEach((c) => (c.innerHTML = photoCell({ seq: msg.seq, photo: 1 })));
+  if (msg.type === "photo") flashes.forEach((f, id) => { if (f.seq === msg.seq) { f.photo = true; paintFlash(id); } });
   if (msg.type === "alarm" && msg.alarm.priority === 1) { toast(`Critical: ${msg.alarm.title}`, "bad"); chime(); }
   if (["alarm", "alarms"].includes(msg.type)) { refreshBadges(); if ($("#queue")) loadQueue(current === "monitor"); }
   if (["doors", "devices"].includes(msg.type)) { setSys(); refreshBadges(); if (["monitor", "doors"].includes(current) && $("#panel").classList.contains("hidden")) render(); }
@@ -1055,7 +1057,37 @@ PAGES.maps = async (el) => {
     const reveal = () => { p.classList.add("found"); p.scrollIntoView({ block: "center", inline: "center", behavior: "smooth" }); showPin(target); };
     $("#plan").complete ? reveal() : $("#plan").addEventListener("load", reveal, { once: true });
   }
+  flashes.forEach((f, id) => paintFlash(id));  // a re-render (an alarm, a door change) keeps what is showing
 };
+
+// Live reactions on the map: a door's pin flashes green with the person's
+// face and name when it lets someone in, and red when it refuses someone.
+const flashes = new Map();  // door id -> { ok, title, name, seq, photo }
+const FLASH_MS = 4000;
+function flashDoor(e) {
+  const ok = e.kind === "access.granted";
+  const f = { ok, seq: e.seq, photo: !!e.photo, name: e.cardholder_name || (ok ? "" : "Unrecognised"),
+              title: ok ? "Access granted" : e.kind === "door.unauthorised_person" ? "Unauthorised person" : "Access denied" };
+  flashes.set(e.door_id, f);
+  paintFlash(e.door_id, true);
+  setTimeout(() => {
+    if (flashes.get(e.door_id) !== f) return;  // a newer entry at the same door took over
+    flashes.delete(e.door_id);
+    const pin = $(`#stage .pin[data-pin="${e.door_id}"]`);
+    pin?.classList.remove("flash-ok", "flash-bad");
+    $(".pin-flash", pin || document.createElement("i"))?.remove();
+  }, FLASH_MS);
+}
+function paintFlash(id, restart = false) {
+  const f = flashes.get(id), pin = $(`#stage .pin[data-pin="${id}"]`);
+  if (!f || !pin) return;
+  pin.classList.remove("flash-ok", "flash-bad");
+  if (restart) void pin.offsetWidth;  // restart the pulse for a new entry
+  pin.classList.add(f.ok ? "flash-ok" : "flash-bad");
+  $(".pin-flash", pin)?.remove();
+  const face = f.photo ? `<img src="/api/photos/${f.seq}.jpg" alt="">` : `<span class="ph">${icon("user")}</span>`;
+  pin.insertAdjacentHTML("beforeend", `<span class="pin-flash ${f.ok ? "ok" : "bad"}">${face}<span><b>${esc(f.title)}</b>${esc(f.name)}</span></span>`);
+}
 
 // Opens the maps on a door's floor with the door highlighted.
 function goMap(doorId) {

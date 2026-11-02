@@ -85,6 +85,7 @@ async def serve(data: Path, host: str, http_port: int, udp_port: int, *, engines
     def face_evidence(ev: dict, jpeg: bytes, door: str, who: str) -> None:
         rel = stamp_photo(store.data_dir / "photos", jpeg, ev["seq"], ev["ts"], door, who)
         store.x("UPDATE events SET photo=? WHERE seq=?", (rel, ev["seq"]))
+        ev["photo"] = rel  # the event is published after this, so the live feed and map show the photo at once
         hub.publish({"type": "photo", "seq": ev["seq"]})
 
     ctl.on_face_evidence = face_evidence
