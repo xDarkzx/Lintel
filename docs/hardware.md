@@ -31,7 +31,7 @@ GPIO cannot power a strike directly.
 
 A wall unit at head height beside the door that recognises people as they walk
 up, with an optional overhead camera for doors where a person hidden behind
-another must not be missed. Design: `docs/superpowers/specs/2026-11-03-lintel-vision-design.md`.
+another must not be missed.
 Prices are rough 2026 US figures; confirm with NZ resellers.
 
 | Part | Choice | Approx. | Notes |

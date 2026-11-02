@@ -87,6 +87,22 @@ class VisionUnit:
         payload = bytes([len(pin)]) + pin.encode().ljust(PIN_MAX, b"\x00") + bytes([0])
         return self._decision(self._exchange(MsgType.PIN_REQ, payload, MsgType.PIN_RESP))
 
+    def photo(self, jpeg: bytes) -> int:
+        """A keypad's camera photo of the request just made, signed and bound
+        to that request's counter as a keypad's photos are. Returns the HTTP status."""
+        req = self.ctr
+        mac = hmac.new(photo_key(self.key), f"{self.door}:{req}:".encode() + hashlib.sha256(jpeg).digest(),
+                       hashlib.sha256).hexdigest()
+        status, _ = self.post(f"/api/door/{self.door}/photo", jpeg, {"x-lintel-req": str(req), "x-lintel-mac": mac})
+        return status
+
+    def diag(self, firmware: str = "1.4.2", uptime_s: int = 0, temp_c: int = 41) -> None:
+        """A keypad's health report: firmware, uptime, memory, temperature, camera and reader."""
+        payload = firmware.encode()[:8].ljust(8, b"\x00") + struct.pack(
+            "<IBIIIbBBHHH", uptime_s, 1, 182_000, 151_000, 7_800_000, temp_c, 1, 1, 0, 0, 38)
+        self.ctr += 1
+        self.deliver(seal(self.key, self.net, Header(MsgType.DIAG, 0, self.door, self.ctr), payload))  # no reply
+
     def heartbeat(self, uptime_s: int = 0) -> None:
         """Tells the server the unit is alive; the reply carries the door's mode."""
         payload = struct.pack("<BHbHIB", 0, 0, 0, 0, uptime_s, 0)

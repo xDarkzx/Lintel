@@ -297,6 +297,16 @@ td .two { display: flex; flex-direction: column; } td .two small { color: var(--
 .pin.found .pin-dot { animation: pin-found 1s ease-out 4; }
 @keyframes pin-alarm { from { box-shadow: 0 0 0 0 rgba(180, 83, 9, .6); } to { box-shadow: 0 0 0 14px rgba(180, 83, 9, 0); } }
 @keyframes pin-found { from { box-shadow: 0 0 0 0 rgba(29, 78, 216, .75); } to { box-shadow: 0 0 0 26px rgba(29, 78, 216, 0); } }
+.pin.flash-ok .pin-dot { background: var(--ok); animation: pin-ok .9s ease-out 3; }
+.pin.flash-bad .pin-dot { background: var(--bad); animation: pin-bad .9s ease-out 3; }
+.pin.flash-ok, .pin.flash-bad { z-index: 5; }
+@keyframes pin-ok { from { box-shadow: 0 0 0 0 rgba(22, 163, 74, .75); } to { box-shadow: 0 0 0 22px rgba(22, 163, 74, 0); } }
+@keyframes pin-bad { from { box-shadow: 0 0 0 0 rgba(220, 38, 38, .8); } to { box-shadow: 0 0 0 24px rgba(220, 38, 38, 0); } }
+.pin-flash { position: absolute; bottom: calc(100% + 4px); left: 50%; transform: translateX(-50%); display: flex; align-items: center; gap: 8px; padding: 6px 12px 6px 6px; border-radius: 10px; background: var(--surface); color: var(--text); border: 1px solid var(--line); border-left: 4px solid var(--ok); box-shadow: 0 6px 18px rgba(0, 0, 0, .18); font-size: 12px; white-space: nowrap; text-align: left; animation: pop .2s ease-out; pointer-events: none; }
+.pin-flash.bad { border-left-color: var(--bad); }
+.pin-flash b { display: block; font-size: 12.5px; color: var(--ok); }
+.pin-flash.bad b { color: var(--bad); }
+.pin-flash img, .pin-flash .ph { width: 40px; height: 40px; border-radius: 6px; object-fit: cover; display: grid; place-items: center; background: var(--surface-2, #eef0f3); }
 .pin-pop { position: absolute; z-index: 6; width: 250px; transform: translate(-50%, calc(-100% - 22px)); padding: 12px; background: var(--surface); border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--shadow-lg); cursor: default; }
 .pin-pop h4 { margin: 0 0 2px; font-size: 14px; } .pin-pop p { margin: 0 0 10px; font-size: 12.5px; color: var(--muted); }
 .pin-pop .actions { flex-wrap: wrap; gap: 6px; }
