@@ -36,16 +36,31 @@
 ```
 
 <p align="center">
-  <img src="docs/media/panel-keypad.jpg" width="240" alt="Keypad screen, captured from the panel">
-  &nbsp;
-  <img src="docs/media/console-monitor.jpg" width="560" alt="Operations console monitor">
+  <img src="docs/media/demo.gif" width="860" alt="The Lintel console during the demo: a group walks through the Lintel Vision door and each person is logged by name, a stranger behind them raises a P1 unauthorised-person alarm, a printed photo is refused as a spoof, a contractor without access is named, PIN guessing locks the server room keypad, and the audit chain is verified">
 </p>
-<p align="center"><sub>Left: the keypad's own screen, captured remotely from the console. Right: the operations console (entry photos blurred).</sub></p>
+<p align="center"><sub>The <a href="#try-it-in-one-command">one-command demo</a>: a group walks in and each person is logged, a stranger tailgating them raises a P1 alarm, a photo held to the camera is refused, PIN guessing locks a keypad, and the audit chain verifies. Sped up 1.6x; <a href="docs/media/demo.webm">full-quality video</a>. The people are demo cartoons.</sub></p>
 
 The keypad has no network of its own and holds no PINs. Every message between
 keypad and server is sealed with that door's AES-128 key, so the controller in
 the middle, or anyone who takes it over, can relay traffic but cannot read it
 or forge a grant.
+
+## Try it in one command
+
+No hardware needed. This starts a real Lintel server with a seeded site (two
+keypad doors and a walk-through Lintel Vision door) and doors that keep
+generating traffic over the real sealed protocol: people coming and going, a
+stranger tailgating a group, a printed photo held up to the camera, a PIN
+being guessed, a duress PIN.
+
+```sh
+docker compose -f demo/compose.yaml up --build
+```
+
+Open https://localhost:8443 (the certificate is self-signed) and sign in as
+`admin` with the password printed in the log. Every start is a fresh site. The
+demo's people are drawn cartoons, recognised by a stand-in face engine that
+only the demo loads.
 
 ## What it does
 

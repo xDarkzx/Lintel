@@ -270,6 +270,13 @@ class Store:
                  tuple(row[f] for f in ("seq", "ts", "kind", "door_id", "cardholder_id", "operator", "decision",
                                         "reason", "detail", "req_ctr", "link")))
             row["photo"] = None
+            # Not part of the record or its link: the names the console shows,
+            # so an event pushed to the live feed reads like one loaded later.
+            door = db.q1("SELECT name FROM doors WHERE id=?", (door_id,)) if door_id is not None else None
+            person = (db.q1("SELECT first_name, last_name FROM cardholders WHERE id=?", (cardholder_id,))
+                      if cardholder_id is not None else None)
+            row["door_name"] = door["name"] if door else None
+            row["cardholder_name"] = f"{person['first_name']} {person['last_name']}" if person else None
             return row
 
     def verify_journal(self) -> dict[str, Any]:

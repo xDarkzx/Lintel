@@ -44,7 +44,11 @@ async def maintenance(store: Store, app) -> None:
         await asyncio.sleep(3600)
 
 
-async def serve(data: Path, host: str, http_port: int, udp_port: int) -> None:
+async def serve(data: Path, host: str, http_port: int, udp_port: int, *, engines: tuple | None = None,
+                background=None) -> None:
+    """`engines` (faces, people, live) replaces the model-backed engines, and
+    `background(store, ctl, http_port, udp_port)` runs beside the server; the
+    demo uses both, a production server neither."""
     store = Store(data)
     if not store.db.claim_server():
         raise SystemExit("another Lintel server is already running on this database; run exactly one server "
@@ -52,28 +56,31 @@ async def serve(data: Path, host: str, http_port: int, udp_port: int) -> None:
     hub = Hub()
     ctl = Controller(store, AccessEngine(store), hub.publish)
     ctl.load_doors()
-    faces = None
-    models = Path(os.environ.get("LINTEL_MODELS", Path(__file__).resolve().parent.parent / "models"))
-    try:
-        from .faces import FaceEngine
-        faces = FaceEngine(models)
-        logging.getLogger("lintel").info("face recognition ready (%s)", models)
-    except (FileNotFoundError, ImportError) as e:
-        logging.getLogger("lintel").warning("face recognition disabled: %s", e)
-    live = None
-    try:
-        from .liveness import PassiveLiveness
-        live = PassiveLiveness(models)
-        logging.getLogger("lintel").info("face liveness checks ready (%s)", models)
-    except (FileNotFoundError, ImportError) as e:
-        logging.getLogger("lintel").warning("guided face enrolment disabled: %s", e)
-    people = None
-    try:
-        from .tailgate import PersonDetector
-        people = PersonDetector(models)
-        logging.getLogger("lintel").info("tailgating detection ready (%s)", models)
-    except (FileNotFoundError, ImportError) as e:
-        logging.getLogger("lintel").warning("tailgating detection disabled: %s", e)
+    if engines is not None:
+        faces, people, live = engines
+    else:
+        faces = None
+        models = Path(os.environ.get("LINTEL_MODELS", Path(__file__).resolve().parent.parent / "models"))
+        try:
+            from .faces import FaceEngine
+            faces = FaceEngine(models)
+            logging.getLogger("lintel").info("face recognition ready (%s)", models)
+        except (FileNotFoundError, ImportError) as e:
+            logging.getLogger("lintel").warning("face recognition disabled: %s", e)
+        live = None
+        try:
+            from .liveness import PassiveLiveness
+            live = PassiveLiveness(models)
+            logging.getLogger("lintel").info("face liveness checks ready (%s)", models)
+        except (FileNotFoundError, ImportError) as e:
+            logging.getLogger("lintel").warning("guided face enrolment disabled: %s", e)
+        people = None
+        try:
+            from .tailgate import PersonDetector
+            people = PersonDetector(models)
+            logging.getLogger("lintel").info("tailgating detection ready (%s)", models)
+        except (FileNotFoundError, ImportError) as e:
+            logging.getLogger("lintel").warning("tailgating detection disabled: %s", e)
 
     def face_evidence(ev: dict, jpeg: bytes, door: str, who: str) -> None:
         rel = stamp_photo(store.data_dir / "photos", jpeg, ev["seq"], ev["ts"], door, who)
@@ -94,7 +101,10 @@ async def serve(data: Path, host: str, http_port: int, udp_port: int) -> None:
     logging.getLogger("lintel").info("HTTPS certificate SHA-256 %s", fp)
     server = uvicorn.Server(uvicorn.Config(app, host=host, port=http_port, log_level="info", server_header=False,
                                            ssl_certfile=str(cert), ssl_keyfile=str(key)))
-    await asyncio.gather(server.serve(), run_controller(ctl, host, udp_port), maintenance(store, app))
+    tasks = [server.serve(), run_controller(ctl, host, udp_port), maintenance(store, app)]
+    if background is not None:
+        tasks.append(background(store, ctl, http_port, udp_port))
+    await asyncio.gather(*tasks)
 
 
 def restore(args) -> None:

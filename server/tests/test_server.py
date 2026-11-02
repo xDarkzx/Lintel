@@ -433,3 +433,13 @@ def test_an_unconfirmed_two_factor_secret_expires(env):
     r = client.post("/api/me/mfa/confirm", json={"code": totp_now(secret)})
     assert r.status_code == 400 and "expired" in r.json()["detail"]
     assert store.q1("SELECT totp_secret FROM operators WHERE id=?", (admin_id,))["totp_secret"] is None
+
+
+def test_live_events_carry_the_names_the_console_shows(env):
+    store, ctl, client, panel, gid = env
+    ch = add(client, gid, "Dan", "2468")
+    ev = store.journal("test.named", door_id=1, cardholder_id=ch["id"], detail="x")
+    assert ev["door_name"] == "Main Entrance" and ev["cardholder_name"] == "Dan Test"
+    bare = store.journal("test.bare")
+    assert bare["door_name"] is None and bare["cardholder_name"] is None
+    assert client.get("/api/journal/verify").json()["ok"]  # names are not part of the chained record

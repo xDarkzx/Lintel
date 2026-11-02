@@ -87,6 +87,11 @@ class VisionUnit:
         payload = bytes([len(pin)]) + pin.encode().ljust(PIN_MAX, b"\x00") + bytes([0])
         return self._decision(self._exchange(MsgType.PIN_REQ, payload, MsgType.PIN_RESP))
 
+    def heartbeat(self, uptime_s: int = 0) -> None:
+        """Tells the server the unit is alive; the reply carries the door's mode."""
+        payload = struct.pack("<BHbHIB", 0, 0, 0, 0, uptime_s, 0)
+        self._exchange(MsgType.HEARTBEAT, payload, MsgType.HEARTBEAT_ACK)
+
     def crossed(self, entered: int, tracks: list[int], overhead: bool = False) -> CrossingAck:
         """The door has closed: report how many went in and which tracks they were."""
         c = Crossing(self.passage, entered, overhead, tuple(self.passage | t for t in tracks))
